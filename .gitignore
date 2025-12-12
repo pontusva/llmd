@@ -1,0 +1,65 @@
+# Rust build artifacts
+target/
+Cargo.lock
+
+
+# ML Model weights (keep configs and tokenizers)
+models/llm/*/model*.safetensors
+models/llm/*/*.safetensors
+models/minilm/*.safetensors
+
+# Memory databases
+*.sqlite
+*.db
+data.db
+persona_memory.sqlite
+
+# Cache and temporary files
+.cache/
+*.tmp
+*.temp
+*.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# Backup files
+*.bak
+*.backup
+*.orig
+
+# Rust specific
+**/*.rs.bk
+rusty-tags.vi
+
+# Documentation builds
+book/
+
+# Test coverage
+*.profraw
+coverage/
+
+# Cargo registry and dependencies
+.cargo/
+vendor/
