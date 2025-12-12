@@ -7,8 +7,8 @@ use std::fs;
 use crate::persona_memory::EmbeddingModel;
 
 pub struct Model {
-    model: BertModel,
-    tokenizer: Tokenizer,
+    model: Option<BertModel>,
+    tokenizer: Option<Tokenizer>,
     device: Device,
 }
 
@@ -40,46 +40,65 @@ impl Model {
         let model = BertModel::load(vb, &config)?;
 
         Ok(Self {
-            model,
-            tokenizer,
+            model: Some(model),
+            tokenizer: Some(tokenizer),
             device,
         })
     }
 
+    pub fn dummy() -> Self {
+        Self {
+            model: None,
+            tokenizer: None,
+            device: Device::Cpu,
+        }
+    }
+
     pub async fn infer(&self, text: &str) -> Result<Vec<f32>> {
+        let model = self.model.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Embedding model not available - vector memory features are disabled")
+        })?;
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Embedding tokenizer not available - vector memory features are disabled")
+        })?;
+
         // Tokenize text
-        let encoding = self.tokenizer.encode(text, true)
+        let encoding = tokenizer.encode(text, true)
             .map_err(|e| anyhow::anyhow!("Failed to encode text: {}", e))?;
         let ids = encoding.get_ids();
         let token_type_ids = encoding.get_type_ids();
-    
+
         // Convert tokens → Tensor
         let input_ids = Tensor::new(ids, &self.device)?.unsqueeze(0)?;
         let token_types = Tensor::new(token_type_ids, &self.device)?.unsqueeze(0)?;
-    
+
         // Run BERT forward
-        let output = self.model.forward(&input_ids, &token_types, None)?;
-    
+        let output = model.forward(&input_ids, &token_types, None)?;
+
         // Extract CLS embedding — output[0, 0, :]
         let cls = output.i((0, 0))?;
-    
+
         // Convert to Vec<f32>
         let mut emb = cls.to_vec1::<f32>()?;
-    
+
         // ---- Correct L2 normalization ----
         let norm: f32 = emb.iter().map(|v| v * v).sum::<f32>().sqrt();
-    
+
         if norm > 1e-8 {
             for v in emb.iter_mut() {
                 *v /= norm;
             }
         }
         // ----------------------------------
-    
+
         Ok(emb)
     }
 
     pub async fn infer_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if self.model.is_none() {
+            return Err(anyhow::anyhow!("Embedding model not available - vector memory features are disabled"));
+        }
+
         let mut embeddings = Vec::with_capacity(texts.len());
 
         for text in texts {

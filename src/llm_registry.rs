@@ -16,6 +16,24 @@ pub struct LlmRegistry {
 }
 
 impl LlmRegistry {
+    pub fn new() -> Self {
+        Self {
+            models: HashMap::new(),
+            loaded_models: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn register(&mut self, id: String, model: Arc<dyn LlmModelTrait>) -> Result<()> {
+        // Store metadata (we'll use a dummy path since we don't have one)
+        self.models.insert(id.clone(), ModelMetadata {
+            path: format!("loaded://{}", id),
+        });
+
+        // Store the loaded model directly
+        self.loaded_models.lock().unwrap().insert(id, model);
+        Ok(())
+    }
+
     pub async fn discover_models(base_dir: &str) -> Result<Self> {
         let mut models: HashMap<String, ModelMetadata> = HashMap::new();
         let base = Path::new(base_dir);
@@ -89,6 +107,7 @@ impl LlmRegistry {
                 }
             }
         } else {
+            warn!("Model not found in registry: {}", id);
             Ok(None)
         }
     }

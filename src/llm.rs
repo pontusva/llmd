@@ -41,18 +41,21 @@ pub trait LlmModelTrait: Send + Sync {
     async fn stream_generate(&self, options: GenerateOptions) -> Result<ReceiverStream<String>>;
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
-pub struct DummyLlm;
+pub struct StubLlm;
 
+#[cfg(test)]
 #[allow(dead_code)]
-impl DummyLlm {
+impl StubLlm {
     pub fn new() -> Self {
         Self
     }
 }
 
+#[cfg(test)]
 #[async_trait]
-impl LlmModelTrait for DummyLlm {
+impl LlmModelTrait for StubLlm {
     async fn generate(&self, prompt: &str) -> Result<String> {
         Ok(format!("Echo: {}", prompt))
     }
@@ -76,8 +79,25 @@ impl LlmModelTrait for DummyLlm {
     }
 
     async fn stream_generate(&self, options: GenerateOptions) -> Result<ReceiverStream<String>> {
-        // For DummyLlm, just use the same fake streaming as before
-        self.stream(options).await
+        let (tx, rx) = mpsc::channel(16);
+
+        tokio::spawn(async move {
+            // Emit deterministic fake tokens for testing streaming
+            let fake_tokens = vec![
+                "Test", " ", "token", " ", "1", " ", "Test", " ", "token", " ", "2", " ", "Test", " ", "token", " ", "3"
+            ];
+
+            for token in fake_tokens {
+                // Small delay to simulate real streaming
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+                if tx.send(token.to_string()).await.is_err() {
+                    break; // Receiver dropped
+                }
+            }
+        });
+
+        Ok(ReceiverStream::new(rx))
     }
 }
 
@@ -92,6 +112,7 @@ pub struct CandleLlm {
 
 impl CandleLlm {
     pub fn new(model_dir: &str) -> anyhow::Result<Self> {
+        tracing::info!("Loading CandleLlm from directory: {}", model_dir);
         let device = Device::new_metal(0).unwrap_or(Device::Cpu);
 
         let tokenizer = load_tokenizer(model_dir)?;
@@ -561,9 +582,6 @@ impl CandleLlm {
         let mut logits_buf: Vec<f32> = Vec::new();
         let mut indices_buf: Vec<usize> = Vec::new();
 
-        // Track the previously decoded text length for delta extraction
-        let mut previous_decoded_len = 0;
-
         for _ in 0..max_tokens {
             let input_tokens: Vec<u32> = if position == 0 {
                 tokens.clone()
@@ -683,21 +701,12 @@ impl CandleLlm {
 
             position += input_tokens.len();
 
-            // Decode the full token sequence and extract the delta
-            let full_decoded = tokenizer.decode(&tokens[prompt_len..], false)
-                .map_err(|e| anyhow::anyhow!("Failed to decode tokens: {}", e))?;
-
-            // Extract only the newly generated text (delta)
-            let new_text = &full_decoded[previous_decoded_len..];
-            previous_decoded_len = full_decoded.len();
-
-            if new_text.is_empty() {
-                continue;
-            }
-
-            if tx.blocking_send(new_text.to_string()).is_err() {
-                // Receiver was dropped, stop generation
-                break;
+            // Send the new token as it gets generated
+            if let Ok(new_text) = tokenizer.decode(&[next], true) {
+                if tx.blocking_send(new_text).is_err() {
+                    // Receiver was dropped, stop generation
+                    break;
+                }
             }
         }
 

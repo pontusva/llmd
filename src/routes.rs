@@ -339,7 +339,7 @@ async fn chat_handler(
 
         // Get keyword-based memory context
         let keyword_memory = pm.build_retrieved_memory_context(&persona_name, &last_user_msg, &memory_config)
-            .unwrap_or_default();
+        .unwrap_or_default();
 
         // Get vector-based memory context
         let vector_memory = if let Some(ref emb) = embedding {
@@ -423,19 +423,19 @@ async fn chat_handler(
 
                         let user_messages_for_memory = user_messages_val.clone();
 
-                        // Extract the last user message for memory heuristics
-                        let last_user_msg = user_messages_for_memory.last()
-                            .map(|m| m.content.clone())
-                            .unwrap_or_else(|| "".to_string());
+                            // Extract the last user message for memory heuristics
+                            let last_user_msg = user_messages_for_memory.last()
+                                .map(|m| m.content.clone())
+                                .unwrap_or_else(|| "".to_string());
 
-                        let memory_config = MemoryConfig {
-                            mode: MemoryMode::Write,
-                            policy: MemoryPolicy::Auto,
-                            debug: false,
+                            let memory_config = MemoryConfig {
+                                mode: MemoryMode::Write,
+                                policy: MemoryPolicy::Auto,
+                                debug: false,
                             vector_threshold: 0.78,
                             vector_top_k: 3,
                             vector_types: vec![MemoryType::Persona, MemoryType::Conversation],
-                        };
+                            };
 
                         // Compute embedding from USER'S input for semantic similarity (not AI response)
                         let embedding = if state_val.embeddings_available {

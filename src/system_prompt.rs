@@ -79,6 +79,11 @@ If a direct answer exists, STOP after answering."
             "Speak like Yoda you must, with wisdom and inverted phrasing."
                 .to_string(),
         );
+        personas.insert(
+            "minimal".to_string(),
+            "You are a helpful assistant."
+                .to_string(),
+        );
 
         Self {
             default_prompt: "You are a helpful AI assistant.".to_string(),
