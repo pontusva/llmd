@@ -1,37 +1,55 @@
-# Inference Server CLI
+# LLM Inference Server
 
-A powerful CLI for interacting with large language models (LLMs) with advanced memory management capabilities.
+A client-server system for interacting with large language models. Features advanced memory management, persona-based conversations, and vector similarity search. Models are loaded via the companion `model-loader` tool.
+
+## Architecture
+
+The system consists of two components:
+
+1. **`llmd` (Server)**: Long-running inference server that loads models and handles all memory/embedding logic
+2. **`cli` (Client)**: Thin terminal client that connects to the server via HTTP
 
 ## Overview
 
-The inference server CLI provides an interactive chat interface with support for multiple LLM models, persona-based memory management, and intelligent context retrieval using both keyword and vector-based semantic search.
+The inference server provides an OpenAI-compatible API with support for multiple LLM models, persona-based memory management, and intelligent context retrieval using both keyword and vector-based semantic search.
 
 ## Quick Start
 
+### 1. Start the Server
+
 ```bash
-# Start interactive chat with default settings
+# Load a model using the model-loader tool (from separate repository)
+# This creates a LoadPlan that gets piped to the server
+model-loader --model phi-2 | cargo run --bin llmd
+
+# Server will start on http://localhost:3000
+```
+
+### 2. Use the Client
+
+```bash
+# Start interactive chat
 cargo run --bin cli
 
-# List available models
+# List available models (from running server)
 cargo run --bin cli -- --list-models
 
-# Chat with specific model and persona
-cargo run --bin cli -- --model phi-2 --persona assistant
+# Chat with specific persona
+cargo run --bin cli -- --persona assistant
 ```
 
 ## CLI Arguments
 
 ### Model Selection
 
-- `--model <MODEL_NAME>`
-
-  - Select which LLM to use for generation
-  - Default: First available model
-  - Example: `--model phi-2`, `--model tinyllama`
-
 - `--list-models`
-  - Display all available LLM models
+
+  - Query the server and display all available LLM models
   - No other arguments processed when this flag is present
+
+- `--model <MODEL_NAME>` (optional)
+  - Specify which model to use (if multiple are loaded)
+  - Default: Auto-discover first available model from server
 
 ### System and Persona Configuration
 
@@ -52,82 +70,21 @@ cargo run --bin cli -- --model phi-2 --persona assistant
   - Enable streaming responses (token-by-token output)
   - Default: False (wait for complete response)
 
-### Memory Management
+### Memory Control
 
-#### Memory Modes
+The CLI includes memory control options that are sent to the server:
 
-- `--memory-mode <MODE>`
-  - Control how memory is used
-  - Options:
-    - `off`: No memory operations
-    - `read`: Read-only memory (no new memories stored)
-    - `write`: Write-only memory (no memory retrieval)
-    - `readwrite`: Full read/write memory access
-  - Default: `readwrite`
-
-#### Memory Policies
-
-- `--memory-policy <POLICY>`
-  - Control how new memories are stored
-  - Options:
-    - `append`: Always append new content to existing memories
-    - `replace`: Replace existing memories with new content
-    - `auto`: Intelligent policy (append for conversations, replace for personas)
-  - Default: `auto`
-
-#### Memory Types
-
-- `--memory-types <TYPES>`
-  - Specify which memory types to use for vector search
-  - Comma-separated list
-  - Options: `persona`, `conversation`, `fact`
-  - Default: `persona,conversation`
-  - Example: `--memory-types persona,fact`
-
-#### Memory Tuning
-
-- `--memory-k <NUMBER>`
-
-  - Maximum number of similar memories to retrieve
-  - Default: 3
-  - Example: `--memory-k 5`
-
-- `--memory-threshold <FLOAT>`
-  - Similarity threshold for vector memory retrieval (0.0-1.0)
-  - Lower values = more memories retrieved
-  - Default: 0.78
-  - Example: `--memory-threshold 0.5`
-
-#### Memory Debugging
-
-- `--memory-debug`
-  - Enable detailed memory operation logging
-  - Shows memory retrieval, storage, and embedding operations
-
-#### Memory Management
-
-- `--memory-wipe [PERSONA|"all"]`
-  - Wipe memory for specific persona or all personas
-  - With argument: Wipe specific persona
-  - Without argument: Wipe all personas
-  - Examples:
-    - `--memory-wipe coder` (wipe "coder" persona)
-    - `--memory-wipe all` (wipe all personas)
-    - `--memory-wipe` (wipe all personas)
-
-### Legacy Arguments
-
-- `--memory-update <CONTENT>` (deprecated)
-  - Legacy memory update functionality
-  - Kept for backward compatibility
+- `--persona <NAME>`
+  - Select which persona memory context to use
+  - Personas maintain separate memory contexts on the server
+  - Default: "minimal" (fast, minimal prompt)
+  - Available: "default", "minimal", "rogue", "developer", "therapist", "pirate", "yoda"
 
 ## Interactive Commands
 
-Once in interactive mode, use these commands:
+Once in chat mode, use these commands:
 
 - `/exit` - Exit the chat session
-- `/clear` - Clear conversation history and screen
-- `/system <PROMPT>` - Change system prompt for current session
 
 ## Memory System
 
@@ -152,119 +109,104 @@ The inference server uses a sophisticated multi-layered memory system:
 
 ## Examples
 
-### Basic Chat
+### Basic Usage
 
 ```bash
+# 1. Start server with loaded model
+model-loader --model phi-2 | cargo run --bin llmd
+
+# 2. In another terminal, start chat
 cargo run --bin cli
 ```
 
-### Advanced Configuration
+### Server Options
 
 ```bash
-cargo run --bin cli \
-  --model phi-2 \
-  --persona assistant \
-  --memory-mode readwrite \
-  --memory-policy auto \
-  --memory-types persona,conversation \
-  --memory-debug
+# Load different model
+model-loader --model tinyllama | cargo run --bin llmd
+
+# Server runs on http://localhost:3000 by default
 ```
 
-### Memory Management
+### Client Options
 
 ```bash
-# Wipe all memory
-cargo run --bin cli -- --memory-wipe
+# Use specific persona
+cargo run --bin cli -- --persona developer
 
-# Wipe specific persona
-cargo run --bin cli -- --memory-wipe coder
-
-# Debug memory operations
-cargo run --bin cli -- --memory-debug --memory-threshold 0.5
-```
-
-### Model Selection
-
-```bash
-# List available models
+# List available models from server
 cargo run --bin cli -- --list-models
-
-# Use specific model
-cargo run --bin cli -- --model tinyllama --stream
 ```
 
-## Model Setup
+## Model Loading
 
-⚠️ **Important**: Model weights are **not included** in this repository due to their large size.
+⚠️ **Important**: Models are loaded by the separate `model-loader` repository, not this one.
 
-### Quick Setup (Recommended)
+### Using the Model Loader
+
+Models are loaded using the companion `model-loader` tool:
 
 ```bash
-# Download all required models automatically
-python3 download_models.py
+# Install model-loader (from separate repository)
+git clone https://github.com/your-org/model-loader.git
+cd model-loader
+cargo build --release
+
+# Load a model and start the server
+./target/release/model-loader --model phi-2 | cargo run --bin llmd
 ```
 
-### Manual Download Options
+The model-loader handles:
 
-**Option 1: Using huggingface-cli**
-
-```bash
-# Install huggingface-cli
-pip install huggingface_hub[cli]
-
-# Download models
-huggingface-cli download microsoft/phi-2 --local-dir models/llm/phi-2
-huggingface-cli download TinyLlama/TinyLlama-1.1B-Chat-v1.0 --local-dir models/llm/tinyllama
-```
-
-**Option 2: Using Python**
-
-```python
-from huggingface_hub import snapshot_download
-snapshot_download(repo_id="microsoft/phi-2", local_dir="models/llm/phi-2")
-```
-
-**Option 3: Manual Download**
-Visit [Hugging Face](https://huggingface.co) and download the following models:
-
-- `microsoft/phi-2` → `models/llm/phi-2/`
-- `TinyLlama/TinyLlama-1.1B-Chat-v1.0` → `models/llm/tinyllama/`
-- `sentence-transformers/all-MiniLM-L6-v2` → `models/minilm/` (for embeddings)
+- Downloading model weights from Hugging Face
+- Creating optimized LoadPlans
+- Streaming models to the inference server
 
 ### Supported Models
 
-The CLI automatically discovers models from the `models/llm/` directory. Each model directory should contain:
+The server supports models loaded via LoadPlan:
 
-- `config.json` - Model configuration ✅ (committed)
-- `tokenizer.json` - Tokenizer configuration ✅ (committed)
-- `*.safetensors` - Model weights ❌ (download separately)
+- **Llama models**: Llama 2, Llama 3, Llama 3.2
+- **Mistral models**: Mistral 7B, Mixtral
+- **Phi models**: Phi-2, Phi-3
+- **Other architectures**: As supported by `candle-transformers`
 
-Currently supported architectures:
-
-- Llama models (including Llama-3.2)
-- Mistral models
-- Phi models
+Models are automatically detected and made available through the `/v1/models` API endpoint.
 
 ## Requirements
 
 - Rust toolchain
-- Models downloaded to `models/llm/` directory
-- Embedding model (optional, for vector memory features)
+- Running `model-loader` instance (separate repository)
+- Server started with model LoadPlan piped from stdin
+
+## API Endpoints
+
+The server provides OpenAI-compatible endpoints:
+
+- `GET /v1/models` - List available models
+- `POST /v1/chat/completions` - Chat completions with memory support
+- `GET /v1/persona/:persona/memory` - Get persona memory
+- `POST /v1/persona/:persona/memory/reset` - Reset persona memory
 
 ## Troubleshooting
 
+### Server Won't Start
+
+- Ensure model-loader is properly configured
+- Check that LoadPlan is being piped to server stdin
+- Verify model files exist in model-loader's cache
+
 ### Model Not Found
 
-- Ensure model files are in `models/llm/<model_name>/`
-- Run `--list-models` to verify model discovery
+- Use `cargo run --bin cli -- --list-models` to check available models
+- Ensure model was properly loaded by model-loader
 
-### Memory Issues
+### Connection Issues
 
-- Use `--memory-debug` to see memory operations
-- Check embedding model availability for vector features
-- Use `--memory-wipe` to reset memory if corrupted
+- Verify server is running on http://localhost:3000
+- Check that model-loader successfully created LoadPlan
 
 ### Performance Issues
 
-- Adjust `--memory-k` and `--memory-threshold` for memory retrieval tuning
-- Use `--memory-mode off` to disable memory for faster responses
+- Use `--persona minimal` for fastest responses
+- Memory operations happen server-side automatically
