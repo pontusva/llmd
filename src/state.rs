@@ -7,6 +7,7 @@ use crate::system_prompt::SystemPromptManager;
 use crate::persona_memory::IntelligentMemory;
 use crate::llm_registry::LlmRegistry;
 use crate::llm::LlmModelTrait;
+use crate::executor::Executor;
 
 
 #[derive(Clone)]
@@ -18,6 +19,8 @@ pub struct AppState {
     pub store: Arc<Mutex<VectorStore>>,
     pub system_prompt: SystemPromptManager,
     pub persona_memory: Arc<Mutex<IntelligentMemory>>,
+    /// Executor owns execution authority and agent state mutations
+    pub executor: Arc<Executor>,
 }
 
 use model_loader_core::plan::{LoadPlan, LoadStep};
@@ -132,14 +135,23 @@ impl AppState {
         // Debug: show embedding status
         eprintln!("Vector memory: embeddings_available = {}", embeddings_available);
 
+        let model_arc = Arc::new(model);
+        let executor = Arc::new(Executor::new(
+            model_arc.clone(),
+            embeddings_available,
+            SystemPromptManager::new(),
+            persona_memory.clone(),
+        ));
+
         Ok(Self {
-            model: Arc::new(model),
+            model: model_arc,
             embeddings_available,
             llms,
             storage: Arc::new(Mutex::new(storage)),
             store: Arc::new(Mutex::new(vector_store)),
             system_prompt: SystemPromptManager::new(),
             persona_memory,
+            executor,
         })
     }
 }
@@ -197,14 +209,23 @@ impl AppState {
         // Debug: show embedding status
         eprintln!("Vector memory: embeddings_available = {}", embeddings_available);
 
+        let model_arc = Arc::new(model);
+        let executor = Arc::new(Executor::new(
+            model_arc.clone(),
+            embeddings_available,
+            SystemPromptManager::new(),
+            persona_memory.clone(),
+        ));
+
         Ok(Self {
-            model: Arc::new(model),
+            model: model_arc,
             embeddings_available,
             llms,
             storage: Arc::new(Mutex::new(storage)),
             store: Arc::new(Mutex::new(vector_store)),
             system_prompt: SystemPromptManager::new(),
             persona_memory,
+            executor,
         })
     }
 
@@ -218,14 +239,24 @@ impl AppState {
         system_prompt: SystemPromptManager,
         persona_memory: IntelligentMemory,
     ) -> Self {
+        let model_arc = Arc::new(model);
+        let persona_memory_arc = Arc::new(Mutex::new(persona_memory));
+        let executor = Arc::new(Executor::new(
+            model_arc.clone(),
+            embeddings_available,
+            system_prompt.clone(),
+            persona_memory_arc.clone(),
+        ));
+
         Self {
-            model: Arc::new(model),
+            model: model_arc,
             embeddings_available,
             llms: Arc::new(llms),
             storage: Arc::new(Mutex::new(storage)),
             store: Arc::new(Mutex::new(vector_store)),
             system_prompt,
-            persona_memory: Arc::new(Mutex::new(persona_memory)),
+            persona_memory: persona_memory_arc,
+            executor,
         }
     }
 }

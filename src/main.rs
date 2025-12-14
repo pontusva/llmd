@@ -14,6 +14,7 @@ mod prompt_format;
 mod system_prompt;
 mod persona_memory;
 mod llm_registry;
+mod executor;
 
 use std::io::{self, Read};
 

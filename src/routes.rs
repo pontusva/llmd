@@ -9,6 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use crate::state::AppState;
 use crate::persona_memory::{IntelligentMemory, MemoryType, MemoryConfig, MemoryMode, MemoryPolicy, EmbeddingModel};
+use crate::executor::MemoryUpdateTask;
 use uuid::Uuid;
 use futures::StreamExt;
 use serde_json::json;
@@ -274,8 +275,7 @@ async fn chat_handler(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
-    let persona_name = req.persona.clone().unwrap_or_else(|| "default".to_string());
-
+    // Get LLM from registry
     let llm = match state.llms.get(&req.model) {
         Ok(Some(m)) => m,
         Ok(None) => {
@@ -288,6 +288,7 @@ async fn chat_handler(
         }
     };
 
+    // Convert request messages to LLM format
     let mut user_messages: Vec<crate::llm::ChatMessage> = Vec::new();
     for m in &req.messages {
         user_messages.push(crate::llm::ChatMessage {
@@ -296,211 +297,82 @@ async fn chat_handler(
         });
     }
 
-    // Create memory config from request
-    let memory_config = MemoryConfig {
-        mode: if matches!(req.memory_update.as_deref(), Some("disable")) {
-            MemoryMode::Read // Read existing memory but don't write new
-        } else {
-            MemoryMode::ReadWrite // Default: read and write
-        },
-        policy: MemoryPolicy::Auto, // Use intelligent heuristics
-        debug: false, // Could be extended to add debug flag
-        vector_threshold: 0.78, // Default threshold
-        vector_top_k: 3, // Default top-k
-        vector_types: vec![MemoryType::Persona, MemoryType::Conversation], // Default types
-    };
-
-    // Extract the last user message for memory retrieval
-    let last_user_msg = user_messages.last()
-        .map(|m| m.content.clone())
-        .unwrap_or_else(|| "".to_string());
-
-    // Get retrieved memory context (keyword + vector)
-    let memory_context = {
-        // Compute embedding first (before acquiring memory lock)
-        let embedding = if !memory_config.vector_types.is_empty() && state.embeddings_available {
-            match state.model.infer(&last_user_msg).await {
-                Ok(emb) => Some(emb),
-                Err(e) => {
-                    if memory_config.debug {
-                        println!("[MEMORY] Failed to compute embedding for vector search: {}", e);
-                    }
-                    None
-                }
-            }
-        } else {
-            if !state.embeddings_available && memory_config.debug && !memory_config.vector_types.is_empty() {
-                println!("[MEMORY] Vector memory disabled - embedding model not available");
-            }
-            None
-        };
-
-        let pm = state.persona_memory.lock().unwrap();
-
-        // Get keyword-based memory context
-        let keyword_memory = pm.build_retrieved_memory_context(&persona_name, &last_user_msg, &memory_config)
-        .unwrap_or_default();
-
-        // Get vector-based memory context
-        let vector_memory = if let Some(ref emb) = embedding {
-            pm.build_vector_memory_context(&persona_name, emb, &memory_config)
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        // Combine both types of memory
-        if keyword_memory.is_empty() && vector_memory.is_empty() {
-            String::new()
-        } else if keyword_memory.is_empty() {
-            vector_memory
-        } else if vector_memory.is_empty() {
-            keyword_memory
-        } else {
-            format!("{}\n\n{}", keyword_memory, vector_memory)
-        }
-    };
-
-    // Build messages with integrated memory context
-    let full_messages = state.system_prompt.build_chat_messages(
-        &user_messages,
-        req.system_prompt.as_deref(),
-        req.persona.as_deref(),
-        Some(&memory_context),
-    );
-
-
+    // Build generation options
     let mut opts = crate::llm::GenerateOptions::default();
-    opts.messages = full_messages;
+    opts.messages = user_messages.clone(); // Executor will override with full messages
     if let Some(v) = req.max_tokens { opts.max_tokens = v; }
     if let Some(v) = req.temperature { opts.temperature = v; }
     if let Some(v) = req.top_p { opts.top_p = v; }
     if let Some(v) = req.top_k { opts.top_k = v; }
     if let Some(v) = req.repetition_penalty { opts.repetition_penalty = v; }
 
+
     let id = format!("chatcmpl-{}", Uuid::new_v4());
 
     if req.stream == Some(true) {
-        // Streaming response
-        let token_stream = match llm.stream_generate(opts).await {
-            Ok(s) => s,
+        // Execute streaming request via Executor
+        let (token_stream, memory_task) = match state.executor.execute_stream(
+            llm,
+            user_messages,
+            req.persona.as_deref(),
+            req.system_prompt.as_deref(),
+            req.memory_update.as_deref(),
+            opts,
+        ).await {
+            Ok(result) => result,
             Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
         };
 
         use futures::stream;
 
-        // Clone values for the background memory update task
-        let state_clone = state.clone();
-        let persona_name_clone = persona_name.clone();
-        let memory_update_clone = req.memory_update.clone();
+        // Create SSE stream that collects tokens and handles completion
+        let executor_clone = state.executor.clone();
+        let stream = stream::unfold((token_stream, id.clone(), req.model.clone(), String::new(), memory_task), move |(mut ts, id_val, model_val, mut collected, memory_task_val)| {
+            let executor = executor_clone.clone();
+            async move {
+                match ts.next().await {
+                    Some(token) => {
+                        // Collect token for memory update
+                        collected.push_str(&token);
 
-        let stream = stream::unfold((token_stream, id.clone(), req.model.clone(), String::new(), persona_name_clone, memory_update_clone, state_clone, user_messages.clone()), move |(mut ts, id_val, model_val, mut collected, persona_name_val, memory_update_val, state_val, user_messages_val)| async move {
-            match ts.next().await {
-                Some(token) => {
-                    // Collect token for memory update
-                    collected.push_str(&token);
-
-                    let event_json = json!({
-                        "id": id_val,
-                        "object": "chat.completion.chunk",
-                        "model": model_val,
-                        "choices": [{
-                            "index": 0,
-                            "delta": { "content": token },
-                            "finish_reason": null
-                        }],
-                    });
-                    match serde_json::to_string(&event_json) {
-                        Ok(json_str) => Some((Event::default().data(format!("{}\n\n", json_str)), (ts, id_val, model_val, collected, persona_name_val, memory_update_val, state_val, user_messages_val))),
-                        Err(_) => Some((Event::default().data("[ERROR]\n\n"), (ts, id_val, model_val, collected, persona_name_val, memory_update_val, state_val, user_messages_val))),
+                        let event_json = json!({
+                            "id": id_val,
+                            "object": "chat.completion.chunk",
+                            "model": model_val,
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "content": token },
+                                "finish_reason": null
+                            }],
+                        });
+                        match serde_json::to_string(&event_json) {
+                            Ok(json_str) => Some((Event::default().data(format!("{}\n\n", json_str)), (ts, id_val, model_val, collected, memory_task_val))),
+                            Err(_) => Some((Event::default().data("[ERROR]\n\n"), (ts, id_val, model_val, collected, memory_task_val))),
+                        }
                     }
-                }
-                None => {
-                    // Stream finished, update memory
-                    if !matches!(memory_update_val.as_deref(), Some("disable")) {
-                        let final_reply = collected.clone();
-                        let persona_name = persona_name_val.clone();
-
-                        let user_messages_for_memory = user_messages_val.clone();
-
-                            // Extract the last user message for memory heuristics
-                            let last_user_msg = user_messages_for_memory.last()
-                                .map(|m| m.content.clone())
-                                .unwrap_or_else(|| "".to_string());
-
-                            let memory_config = MemoryConfig {
-                                mode: MemoryMode::Write,
-                                policy: MemoryPolicy::Auto,
-                                debug: false,
-                            vector_threshold: 0.78,
-                            vector_top_k: 3,
-                            vector_types: vec![MemoryType::Persona, MemoryType::Conversation],
-                            };
-
-                        // Compute embedding from USER'S input for semantic similarity (not AI response)
-                        let embedding = if state_val.embeddings_available {
-                            match state_val.model.infer(&last_user_msg).await {
-                                Ok(emb) => Some(emb),
-                                Err(e) => {
-                                    eprintln!("Failed to compute embedding for memory storage: {}", e);
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        };
-
-                        // Use intelligent memory update with embeddings
-                        let _ = state_val.persona_memory.lock().unwrap()
-                            .update_memory_with_embedding_sync(MemoryType::Conversation, &persona_name, &last_user_msg, &final_reply, &memory_config, embedding.as_deref());
+                    None => {
+                        // Stream finished - complete memory update via Executor
+                        executor.complete_stream(memory_task_val, &collected).await;
+                        Some((Event::default().data("[DONE]\n\n"), (ts, id_val, model_val, collected, MemoryUpdateTask::Disabled)))
                     }
-
-                    Some((Event::default().data("[DONE]\n\n"), (ts, id_val, model_val, collected, persona_name_val, memory_update_val, state_val, user_messages_val)))
                 }
             }
         }).map(Ok::<_, std::convert::Infallible>);
 
         Sse::new(stream).into_response()
     } else {
-        // Non-streaming response
-        let reply = match llm.generate_with_options(opts).await {
+        // Execute non-streaming request via Executor
+        let reply = match state.executor.execute_chat(
+            llm,
+            user_messages,
+            req.persona.as_deref(),
+            req.system_prompt.as_deref(),
+            req.memory_update.as_deref(),
+            opts,
+        ).await {
             Ok(r) => r,
             Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
         };
-
-        // Update memory for non-streaming
-        if !matches!(req.memory_update.as_deref(), Some("disable")) {
-            // Extract the last user message for memory heuristics
-            let last_user_msg = user_messages.last()
-                .map(|m| m.content.clone())
-                .unwrap_or_else(|| "".to_string());
-
-            let memory_config = MemoryConfig {
-                mode: MemoryMode::Write,
-                policy: MemoryPolicy::Auto,
-                debug: false,
-                vector_threshold: 0.78,
-                vector_top_k: 3,
-                vector_types: vec![MemoryType::Persona, MemoryType::Conversation],
-            };
-
-            // Compute embedding from USER'S input for semantic similarity (not AI response)
-            let embedding = if state.embeddings_available {
-                match state.model.infer(&last_user_msg).await {
-                    Ok(emb) => Some(emb),
-                    Err(e) => {
-                        eprintln!("Failed to compute embedding for memory storage: {}", e);
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            // Use intelligent memory update with embeddings
-            let _ = state.persona_memory.lock().unwrap()
-                .update_memory_with_embedding_sync(MemoryType::Conversation, &persona_name, &last_user_msg, &reply, &memory_config, embedding.as_deref());
-        }
 
         let message = ChatMessage {
             role: "assistant".to_string(),
