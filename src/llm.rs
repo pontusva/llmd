@@ -262,6 +262,9 @@ impl CandleLlm {
         let mut logits_buf: Vec<f32> = Vec::new();
         let mut indices_buf: Vec<usize> = Vec::new();
 
+        // For proper SentencePiece detokenization during streaming
+        let mut previous_decoded_len = 0;
+
         for _ in 0..max_tokens {
             let input_tokens: Vec<u32> = if position == 0 {
                 tokens.clone()
@@ -576,11 +579,14 @@ impl CandleLlm {
         let mut cache = Cache::new(true, dtype, &config, &device)?;
         let mut position = 0usize;
 
+        let start_time = std::time::Instant::now();
         info!("llm: starting streaming generation, prompt_tokens={}", tokens.len());
 
         let mut rng = rand::thread_rng();
+        let mut generated_tokens = 0;
         let mut logits_buf: Vec<f32> = Vec::new();
         let mut indices_buf: Vec<usize> = Vec::new();
+        let mut previous_decoded_len = 0; // For proper SentencePiece detokenization during streaming
 
         for _ in 0..max_tokens {
             let input_tokens: Vec<u32> = if position == 0 {
@@ -701,16 +707,42 @@ impl CandleLlm {
 
             position += input_tokens.len();
 
-            // Send the new token as it gets generated
-            if let Ok(new_text) = tokenizer.decode(&[next], true) {
-                if tx.blocking_send(new_text).is_err() {
+            // Properly detokenize by decoding the entire sequence and extracting only the new text
+            // This handles SentencePiece spacing correctly (raw token concatenation loses spacing)
+            if let Ok(full_decoded) = tokenizer.decode(&tokens[prompt_len..], true) {
+                let new_text = &full_decoded[previous_decoded_len..];
+                previous_decoded_len = full_decoded.len();
+
+                generated_tokens += 1;
+
+                // Log progress every 10 tokens
+                if generated_tokens % 10 == 0 {
+                    let elapsed = start_time.elapsed();
+                    info!("llm: generated {} tokens so far ({}ms elapsed)", generated_tokens, elapsed.as_millis());
+                }
+
+                if tx.blocking_send(new_text.to_string()).is_err() {
                     // Receiver was dropped, stop generation
                     break;
                 }
             }
         }
 
-        info!("llm: finished streaming, total_tokens={}", tokens.len());
+        let total_time = start_time.elapsed();
+        let total_tokens = tokens.len();
+        let tokens_per_sec = if total_time.as_secs_f32() > 0.0 {
+            generated_tokens as f32 / total_time.as_secs_f32()
+        } else {
+            0.0
+        };
+
+        info!(
+            "llm: finished streaming generation, total_tokens={}, generated_tokens={}, time={:.2}s, tokens/sec={:.1}",
+            total_tokens,
+            generated_tokens,
+            total_time.as_secs_f32(),
+            tokens_per_sec
+        );
         Ok(())
     }
 
@@ -733,11 +765,17 @@ impl CandleLlm {
             .map_err(|e| anyhow::anyhow!("Failed to encode prompt: {}", e))?;
 
         let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
+        let prompt_len = tokens.len();
 
+        let start_time = std::time::Instant::now();
         info!("mistral: starting streaming generation, prompt_tokens={}", tokens.len());
 
         let mut rng = rand::thread_rng();
         let mut seqlen_offset = 0usize;
+        let mut generated_tokens = 0;
+
+        // For proper SentencePiece detokenization during streaming
+        let mut previous_decoded_len = 0;
 
         for _ in 0..max_tokens {
             let input = Tensor::new(tokens.as_slice(), &device)?.unsqueeze(0)?;
@@ -797,13 +835,39 @@ impl CandleLlm {
                 break;
             }
 
-            // Send the new token as it gets generated
-            if let Ok(new_text) = tokenizer.decode(&[next_token], true) {
-                let _ = tx.send(new_text);
+            // Properly detokenize by decoding the entire sequence and extracting only the new text
+            // This handles SentencePiece spacing correctly (raw token concatenation loses spacing)
+            if let Ok(full_decoded) = tokenizer.decode(&tokens[prompt_len..], true) {
+                let new_text = &full_decoded[previous_decoded_len..];
+                previous_decoded_len = full_decoded.len();
+
+                generated_tokens += 1;
+
+                // Log progress every 10 tokens
+                if generated_tokens % 10 == 0 {
+                    let elapsed = start_time.elapsed();
+                    info!("mistral: generated {} tokens so far ({}ms elapsed)", generated_tokens, elapsed.as_millis());
+                }
+
+                let _ = tx.send(new_text.to_string());
             }
         }
 
-        info!("mistral: finished streaming, total_tokens={}", tokens.len());
+        let total_time = start_time.elapsed();
+        let total_tokens = tokens.len();
+        let tokens_per_sec = if total_time.as_secs_f32() > 0.0 {
+            generated_tokens as f32 / total_time.as_secs_f32()
+        } else {
+            0.0
+        };
+
+        info!(
+            "mistral: finished streaming generation, total_tokens={}, generated_tokens={}, time={:.2}s, tokens/sec={:.1}",
+            total_tokens,
+            generated_tokens,
+            total_time.as_secs_f32(),
+            tokens_per_sec
+        );
         Ok(())
     }
 
@@ -826,10 +890,16 @@ impl CandleLlm {
             .map_err(|e| anyhow::anyhow!("Failed to encode prompt: {}", e))?;
 
         let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
+        let prompt_len = tokens.len();
 
+        let start_time = std::time::Instant::now();
         info!("phi: starting streaming generation, prompt_tokens={}", tokens.len());
 
         let mut rng = rand::thread_rng();
+        let mut generated_tokens = 0;
+
+        // For proper SentencePiece detokenization during streaming
+        let mut previous_decoded_len = 0;
 
         for _ in 0..max_tokens {
             let input = Tensor::new(tokens.as_slice(), &device)?.unsqueeze(0)?;
@@ -888,13 +958,39 @@ impl CandleLlm {
                 break;
             }
 
-            // Send the new token as it gets generated
-            if let Ok(new_text) = tokenizer.decode(&[next_token], true) {
-                let _ = tx.send(new_text);
+            // Properly detokenize by decoding the entire sequence and extracting only the new text
+            // This handles SentencePiece spacing correctly (raw token concatenation loses spacing)
+            if let Ok(full_decoded) = tokenizer.decode(&tokens[prompt_len..], true) {
+                let new_text = &full_decoded[previous_decoded_len..];
+                previous_decoded_len = full_decoded.len();
+
+                generated_tokens += 1;
+
+                // Log progress every 10 tokens
+                if generated_tokens % 10 == 0 {
+                    let elapsed = start_time.elapsed();
+                    info!("phi: generated {} tokens so far ({}ms elapsed)", generated_tokens, elapsed.as_millis());
+                }
+
+                let _ = tx.send(new_text.to_string());
             }
         }
 
-        info!("phi: finished streaming, total_tokens={}", tokens.len());
+        let total_time = start_time.elapsed();
+        let total_tokens = tokens.len();
+        let tokens_per_sec = if total_time.as_secs_f32() > 0.0 {
+            generated_tokens as f32 / total_time.as_secs_f32()
+        } else {
+            0.0
+        };
+
+        info!(
+            "phi: finished streaming generation, total_tokens={}, generated_tokens={}, time={:.2}s, tokens/sec={:.1}",
+            total_tokens,
+            generated_tokens,
+            total_time.as_secs_f32(),
+            tokens_per_sec
+        );
         Ok(())
     }
 }

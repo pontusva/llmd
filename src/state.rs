@@ -191,7 +191,7 @@ impl AppState {
             vector_store.rebuild_index();
         }
 
-        // Use the provided registry (already populated with loaded models)
+        let llms = Arc::new(LlmRegistry::discover_models("models/llm").await?);
         let persona_memory = Arc::new(Mutex::new(IntelligentMemory::new(db_path)?));
 
         // Debug: show embedding status

@@ -411,8 +411,8 @@ async fn chat_handler(
                         }],
                     });
                     match serde_json::to_string(&event_json) {
-                        Ok(json_str) => Some((Event::default().data(format!("data: {}\n\n", json_str)), (ts, id_val, model_val, collected, persona_name_val, memory_update_val, state_val, user_messages_val))),
-                        Err(_) => Some((Event::default().data("data: [ERROR]\n\n"), (ts, id_val, model_val, collected, persona_name_val, memory_update_val, state_val, user_messages_val))),
+                        Ok(json_str) => Some((Event::default().data(format!("{}\n\n", json_str)), (ts, id_val, model_val, collected, persona_name_val, memory_update_val, state_val, user_messages_val))),
+                        Err(_) => Some((Event::default().data("[ERROR]\n\n"), (ts, id_val, model_val, collected, persona_name_val, memory_update_val, state_val, user_messages_val))),
                     }
                 }
                 None => {
@@ -455,7 +455,7 @@ async fn chat_handler(
                             .update_memory_with_embedding_sync(MemoryType::Conversation, &persona_name, &last_user_msg, &final_reply, &memory_config, embedding.as_deref());
                     }
 
-                    Some((Event::default().data("data: [DONE]\n\n"), (ts, id_val, model_val, collected, persona_name_val, memory_update_val, state_val, user_messages_val)))
+                    Some((Event::default().data("[DONE]\n\n"), (ts, id_val, model_val, collected, persona_name_val, memory_update_val, state_val, user_messages_val)))
                 }
             }
         }).map(Ok::<_, std::convert::Infallible>);
