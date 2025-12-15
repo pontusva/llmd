@@ -144,14 +144,14 @@ impl CandleLlm {
             "mistral" => {
                 let config: MistralConfig = serde_json::from_slice(&config_content)?;
                 let model = Mistral::new(&config, vb)?;
-                Ok(Self {
-                    device,
-                    tokenizer,
+        Ok(Self {
+            device,
+            tokenizer,
                     model: ModelType::Mistral(Arc::new(Mutex::new(model))),
                     config: ConfigType::Mistral(Arc::new(config)),
-                    dtype,
-                    eos_token,
-                })
+            dtype,
+            eos_token,
+        })
             }
             "phi" => {
                 let config: PhiConfig = serde_json::from_slice(&config_content)?;
@@ -710,8 +710,8 @@ impl CandleLlm {
             // Properly detokenize by decoding the entire sequence and extracting only the new text
             // This handles SentencePiece spacing correctly (raw token concatenation loses spacing)
             if let Ok(full_decoded) = tokenizer.decode(&tokens[prompt_len..], true) {
-                let new_text = &full_decoded[previous_decoded_len..];
-                previous_decoded_len = full_decoded.len();
+            let new_text = &full_decoded[previous_decoded_len..];
+            previous_decoded_len = full_decoded.len();
 
                 generated_tokens += 1;
 
@@ -719,13 +719,13 @@ impl CandleLlm {
                 if generated_tokens % 10 == 0 {
                     let elapsed = start_time.elapsed();
                     info!("llm: generated {} tokens so far ({}ms elapsed)", generated_tokens, elapsed.as_millis());
-                }
-
-                if tx.blocking_send(new_text.to_string()).is_err() {
-                    // Receiver was dropped, stop generation
-                    break;
-                }
             }
+
+            if tx.blocking_send(new_text.to_string()).is_err() {
+                // Receiver was dropped, stop generation
+                break;
+            }
+        }
         }
 
         let total_time = start_time.elapsed();
@@ -1167,6 +1167,157 @@ impl CandleLlm {
     #[allow(dead_code)]
     pub fn apply_chat_template(messages: &[ChatMessage]) -> String {
         CandleLlm::format_chatml(messages)
+    }
+}
+
+/// Ollama LLM backend that communicates with Ollama via HTTP API
+pub struct OllamaLlm {
+    pub base_url: String,
+    pub model: String,
+    client: reqwest::Client,
+}
+
+impl OllamaLlm {
+    /// Create a new Ollama LLM instance
+    pub fn new(base_url: String, model: String) -> Self {
+        Self {
+            base_url,
+            model,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Format chat messages using the same ChatML format as CandleLlm
+    fn format_chatml(messages: &[ChatMessage]) -> String {
+        let mut out = String::new();
+        for m in messages {
+            let role = match m.role.as_str() {
+                "system" => "system",
+                "assistant" => "assistant",
+                _ => "user",
+            };
+            out.push_str("<|im_start|>");
+            out.push_str(role);
+            out.push('\n');
+            out.push_str(&m.content);
+            out.push('\n');
+            out.push_str("<|im_end|>\n");
+        }
+        out.push_str("<|im_start|>assistant\n");
+        out
+    }
+}
+
+#[async_trait]
+impl LlmModelTrait for OllamaLlm {
+    async fn generate(&self, prompt: &str) -> Result<String> {
+        let request_body = serde_json::json!({
+            "model": self.model,
+            "prompt": prompt,
+            "stream": false
+        });
+
+        let url = format!("{}/api/generate", self.base_url);
+        let response = self.client
+            .post(&url)
+            .json(&request_body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!("Ollama API error: {}", response.status()));
+        }
+
+        let response_json: serde_json::Value = response.json().await?;
+        let response_text = response_json
+            .get("response")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Invalid response format from Ollama"))?;
+
+        Ok(response_text.to_string())
+    }
+
+    async fn generate_with_options(&self, options: GenerateOptions) -> Result<String> {
+        let prompt = Self::format_chatml(&options.messages);
+        self.generate(&prompt).await
+    }
+
+    async fn stream(&self, _options: GenerateOptions) -> Result<ReceiverStream<String>> {
+        // Alias for stream_generate for compatibility
+        self.stream_generate(_options).await
+    }
+
+    async fn stream_generate(&self, options: GenerateOptions) -> Result<ReceiverStream<String>> {
+        let prompt = Self::format_chatml(&options.messages);
+
+        let (tx, rx) = mpsc::channel(100);
+
+        let request_body = serde_json::json!({
+            "model": self.model,
+            "prompt": prompt,
+            "stream": true
+        });
+
+        let url = format!("{}/api/generate", self.base_url);
+        let client = self.client.clone();
+
+        tokio::spawn(async move {
+            let response = match client.post(&url).json(&request_body).send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let _ = tx.send(format!("Error: {}", e)).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let _ = tx.send(format!("Error: HTTP {}", response.status())).await;
+                return;
+            }
+
+            let mut stream = response.bytes_stream();
+
+            use futures::StreamExt;
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        let chunk_str = match std::str::from_utf8(&bytes) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+
+                        for line in chunk_str.lines() {
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+
+                            match serde_json::from_str::<serde_json::Value>(line) {
+                                Ok(json) => {
+                                    if let Some(done) = json.get("done").and_then(|v| v.as_bool()) {
+                                        if done {
+                                            return;
+                                        }
+                                    }
+
+                                    if let Some(response) = json.get("response").and_then(|v| v.as_str()) {
+                                        if tx.send(response.to_string()).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(format!("Error: {}", e)).await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(ReceiverStream::new(rx))
     }
 }
 

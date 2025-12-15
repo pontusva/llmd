@@ -99,7 +99,7 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -275,6 +275,10 @@ async fn chat_handler(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
+    tracing::info!(
+        "📥 Incoming ChatCompletionRequest:\n{}",
+        serde_json::to_string_pretty(&req).unwrap()
+    );
     // Get LLM from registry
     let llm = match state.llms.get(&req.model) {
         Ok(Some(m)) => m,
@@ -300,6 +304,7 @@ async fn chat_handler(
     // Build generation options
     let mut opts = crate::llm::GenerateOptions::default();
     opts.messages = user_messages.clone(); // Executor will override with full messages
+    
     if let Some(v) = req.max_tokens { opts.max_tokens = v; }
     if let Some(v) = req.temperature { opts.temperature = v; }
     if let Some(v) = req.top_p { opts.top_p = v; }
