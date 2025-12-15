@@ -6,7 +6,7 @@ Cargo.lock
 # ML Model weights (keep configs and tokenizers)
 models/llm/*/model*.safetensors
 models/llm/*/*.safetensors
-models/minilm/*.safetensors
+models/embeddings/minilm/*.safetensors
 
 # Memory databases
 *.sqlite

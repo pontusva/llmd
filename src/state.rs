@@ -141,7 +141,7 @@ impl AppState {
         tool_registry: Arc<ToolRegistry>,
     ) -> anyhow::Result<Self> {
         // ---- Optional embedding model
-        let (model, embeddings_available) = match Model::load("models/minilm").await {
+        let (model, embeddings_available) = match Model::load("models/embeddings/minilm").await {
             Ok(m) => match m.infer("hello world").await {
                 Ok(_) => (m, true),
                 Err(e) => {

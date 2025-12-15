@@ -4,6 +4,7 @@ use crate::persona_memory::{IntelligentMemory, MemoryConfig, MemoryType, MemoryM
 use crate::system_prompt::SystemPromptManager;
 use crate::model::Model;
 use crate::toolport::{ToolRegistry, parse_tool_call};
+use crate::embedding_decision::{EmbeddingDecisionMatrix, MemoryEventKind, DecisionContext, DecisionResult};
 use futures::Stream;
 use serde_json;
 
@@ -27,6 +28,26 @@ impl Executor {
     fn looks_like_json(text: &str) -> bool {
         let trimmed = text.trim();
         trimmed.starts_with('{') || trimmed.starts_with("```json") || trimmed.starts_with("```")
+    }
+
+    /// Create a DecisionContext for the embedding decision matrix
+    fn create_decision_context<'a>(
+        &self,
+        persona: &'a str,
+        memory_update: Option<&'a str>,
+        user_text: &'a str,
+        assistant_text: &'a str,
+        is_streaming: bool,
+    ) -> DecisionContext<'a> {
+        DecisionContext {
+            persona,
+            memory_update,
+            embeddings_available: self.embeddings_available,
+            has_vector_types: !self.build_memory_config(memory_update).vector_types.is_empty(),
+            user_text,
+            assistant_text,
+            is_streaming,
+        }
     }
 
     /// Build enhanced system prompt that includes available tools
@@ -110,11 +131,35 @@ impl Executor {
     ) -> anyhow::Result<String> {
         let persona_name = persona.unwrap_or("default");
 
+        // Extract last user message for decision making
+        let last_user_msg = messages.last()
+            .map(|m| m.content.clone())
+            .unwrap_or_else(|| "".to_string());
+
         // Build memory config from request
         let memory_config = self.build_memory_config(memory_update);
 
-        // Get memory context
-        let memory_context = self.retrieve_memory_context(&messages, persona_name, &memory_config).await;
+        // Make decision for user message
+        let user_decision_ctx = self.create_decision_context(
+            persona_name,
+            memory_update,
+            &last_user_msg,
+            "", // no assistant text yet
+            false, // not streaming
+        );
+        let user_decision = EmbeddingDecisionMatrix::decide(
+            MemoryEventKind::UserMessage,
+            &user_decision_ctx,
+            &memory_config,
+        );
+
+        // Log decision if debug enabled
+        if memory_config.debug {
+            tracing::info!("🧠 User message decision: {} ({})", user_decision.reason, user_decision.tags.join(","));
+        }
+
+        // Get memory context (respect user input embedding decision)
+        let memory_context = self.retrieve_memory_context_with_decision(&messages, persona_name, &memory_config, &user_decision).await;
 
         // Build enhanced system prompt with available tools listed
         let enhanced_system_prompt = self.build_enhanced_system_prompt(system_prompt_override);
@@ -139,6 +184,24 @@ impl Executor {
 
         // Parse model output for tool calls
         if let Some(tool_call) = parse_tool_call(&reply) {
+            // Tool call detected - make decision for tool call JSON
+            let tool_call_decision_ctx = self.create_decision_context(
+                persona_name,
+                memory_update,
+                &last_user_msg,
+                &reply,
+                false,
+            );
+            let tool_call_decision = EmbeddingDecisionMatrix::decide(
+                MemoryEventKind::AssistantToolCallJson,
+                &tool_call_decision_ctx,
+                &memory_config,
+            );
+
+            if memory_config.debug {
+                tracing::info!("🧠 Tool call decision: {} ({})", tool_call_decision.reason, tool_call_decision.tags.join(","));
+            }
+
             // Tool call detected - validate against whitelist
             tracing::info!("Tool call detected: {} with arguments {:?}", tool_call.name, tool_call.arguments);
 
@@ -160,6 +223,37 @@ impl Executor {
                         let result = serde_json::to_string_pretty(&tool_output.payload)
                             .unwrap_or_else(|_| "{\"error\":\"invalid tool output\"}".to_string());
                         let safe_result = Self::strip_chatml(&result);
+
+                        // Make decision for tool result
+                        let tool_result_decision_ctx = self.create_decision_context(
+                            persona_name,
+                            memory_update,
+                            &last_user_msg,
+                            &safe_result,
+                            false,
+                        );
+                        let tool_result_decision = EmbeddingDecisionMatrix::decide(
+                            MemoryEventKind::ToolResult,
+                            &tool_result_decision_ctx,
+                            &memory_config,
+                        );
+
+                        if memory_config.debug {
+                            tracing::info!("🧠 Tool result decision: {} ({})", tool_result_decision.reason, tool_result_decision.tags.join(","));
+                        }
+
+                        // Update memory for tool result if decision allows
+                        if tool_result_decision.should_store_memory {
+                            self.update_memory_with_decision(
+                                persona_name,
+                                &messages,
+                                &safe_result,
+                                &memory_config,
+                                &user_decision,
+                                &tool_result_decision,
+                            ).await;
+                        }
+
                         return Ok(safe_result);
                     }
                     Err(tool_error) => {
@@ -167,6 +261,37 @@ impl Executor {
                         // Jail retry for failed tool execution
                         let jail_reply = self.execute_jail_retry(llm, &messages, persona, &options).await?;
                         let safe_reply = Self::strip_chatml(&jail_reply);
+
+                        // Make decision for jail retry response
+                        let jail_decision_ctx = self.create_decision_context(
+                            persona_name,
+                            memory_update,
+                            &last_user_msg,
+                            &safe_reply,
+                            false,
+                        );
+                        let jail_decision = EmbeddingDecisionMatrix::decide(
+                            MemoryEventKind::JailRetryPlainText,
+                            &jail_decision_ctx,
+                            &memory_config,
+                        );
+
+                        if memory_config.debug {
+                            tracing::info!("🧠 Jail retry decision: {} ({})", jail_decision.reason, jail_decision.tags.join(","));
+                        }
+
+                        // Update memory for jail retry if decision allows
+                        if jail_decision.should_store_memory {
+                            self.update_memory_with_decision(
+                                persona_name,
+                                &messages,
+                                &safe_reply,
+                                &memory_config,
+                                &user_decision,
+                                &jail_decision,
+                            ).await;
+                        }
+
                         return Ok(safe_reply);
                     }
                 }
@@ -175,6 +300,37 @@ impl Executor {
                 tracing::warn!("Rejected unknown tool call: {} (not in registry)", tool_call.name);
                 let jail_reply = self.execute_jail_retry(llm, &messages, persona, &options).await?;
                 let safe_reply = Self::strip_chatml(&jail_reply);
+
+                // Make decision for jail retry response
+                let jail_decision_ctx = self.create_decision_context(
+                    persona_name,
+                    memory_update,
+                    &last_user_msg,
+                    &safe_reply,
+                    false,
+                );
+                let jail_decision = EmbeddingDecisionMatrix::decide(
+                    MemoryEventKind::JailRetryPlainText,
+                    &jail_decision_ctx,
+                    &memory_config,
+                );
+
+                if memory_config.debug {
+                    tracing::info!("🧠 Jail retry decision: {} ({})", jail_decision.reason, jail_decision.tags.join(","));
+                }
+
+                // Update memory for jail retry if decision allows
+                if jail_decision.should_store_memory {
+                    self.update_memory_with_decision(
+                        persona_name,
+                        &messages,
+                        &safe_reply,
+                        &memory_config,
+                        &user_decision,
+                        &jail_decision,
+                    ).await;
+                }
+
                 return Ok(safe_reply);
             }
         }
@@ -185,19 +341,74 @@ impl Executor {
             tracing::warn!("Rejected unsafe JSON output (not a valid tool call)");
             let jail_reply = self.execute_jail_retry(llm, &messages, persona, &options).await?;
             let safe_reply = Self::strip_chatml(&jail_reply);
+
+            // Make decision for jail retry violation (since this was unsafe JSON)
+            let jail_violation_decision_ctx = self.create_decision_context(
+                persona_name,
+                memory_update,
+                &last_user_msg,
+                &safe_reply,
+                false,
+            );
+            let jail_violation_decision = EmbeddingDecisionMatrix::decide(
+                MemoryEventKind::JailRetryViolation,
+                &jail_violation_decision_ctx,
+                &memory_config,
+            );
+
+            if memory_config.debug {
+                tracing::info!("🧠 Jail violation decision: {} ({})", jail_violation_decision.reason, jail_violation_decision.tags.join(","));
+            }
+
+            // Jail retry violations should not store memory (decision will reflect this)
+            if jail_violation_decision.should_store_memory {
+                self.update_memory_with_decision(
+                    persona_name,
+                    &messages,
+                    &safe_reply,
+                    &memory_config,
+                    &user_decision,
+                    &jail_violation_decision,
+                ).await;
+            }
+
             return Ok(safe_reply);
         }
 
-        // Plain text response - validate and return
+        // Plain text response - make decision for assistant response
         let safe_reply = Self::strip_chatml(&reply);
+        let assistant_decision_ctx = self.create_decision_context(
+            persona_name,
+            memory_update,
+            &last_user_msg,
+            &safe_reply,
+            false,
+        );
+        let assistant_decision = EmbeddingDecisionMatrix::decide(
+            MemoryEventKind::AssistantPlainText,
+            &assistant_decision_ctx,
+            &memory_config,
+        );
+
+        if memory_config.debug {
+            tracing::info!("🧠 Assistant response decision: {} ({})", assistant_decision.reason, assistant_decision.tags.join(","));
+        }
+
         if self.validate_response(&safe_reply, false) {
-            // Safe response - update memory
-            if !matches!(memory_update, Some("disable")) {
-                self.update_memory(persona_name, &messages, &safe_reply, &memory_config).await;
+            // Safe response - update memory if decision allows
+            if assistant_decision.should_store_memory {
+                self.update_memory_with_decision(
+                    persona_name,
+                    &messages,
+                    &safe_reply,
+                    &memory_config,
+                    &user_decision,
+                    &assistant_decision,
+                ).await;
             }
             Ok(safe_reply)
         } else {
-            // Unexpected unsafe response - fallback
+            // Unexpected unsafe response - fallback (no memory update)
             tracing::warn!("Rejected unsafe plain text response");
             Ok("I apologize, but I encountered an error processing your request.".to_string())
         }
@@ -216,11 +427,34 @@ impl Executor {
     ) -> anyhow::Result<(Box<dyn Stream<Item = String> + Send + Unpin>, MemoryUpdateTask)> {
         let persona_name = persona.unwrap_or("default").to_string();
 
+        // Extract last user message for decision making
+        let last_user_msg = messages.last()
+            .map(|m| m.content.clone())
+            .unwrap_or_else(|| "".to_string());
+
         // Build memory config from request
         let memory_config = self.build_memory_config(memory_update);
 
-        // Get memory context
-        let memory_context = self.retrieve_memory_context(&messages, &persona_name, &memory_config).await;
+        // Make decision for user message
+        let user_decision_ctx = self.create_decision_context(
+            &persona_name,
+            memory_update,
+            &last_user_msg,
+            "", // no assistant text yet
+            true, // streaming
+        );
+        let user_decision = EmbeddingDecisionMatrix::decide(
+            MemoryEventKind::UserMessage,
+            &user_decision_ctx,
+            &memory_config,
+        );
+
+        if memory_config.debug {
+            tracing::info!("🧠 Stream user decision: {} ({})", user_decision.reason, user_decision.tags.join(","));
+        }
+
+        // Get memory context respecting user input embedding decision
+        let memory_context = self.retrieve_memory_context_with_decision(&messages, &persona_name, &memory_config, &user_decision).await;
 
         // Build full messages with memory
         let full_messages = self.system_prompt.build_chat_messages(
@@ -236,13 +470,14 @@ impl Executor {
         let token_stream = llm.stream_generate(opts).await?;
 
         // Create memory update task for when streaming completes
-        let memory_task = if !matches!(memory_update, Some("disable")) {
+        let memory_task = if !matches!(memory_update, Some("disable")) && user_decision.should_store_memory {
             let messages_clone = messages.clone();
             let memory_config_clone = memory_config.clone();
             MemoryUpdateTask::Enabled {
                 persona_name,
                 messages: messages_clone,
                 memory_config: memory_config_clone,
+                user_decision: user_decision.clone(),
             }
         } else {
             MemoryUpdateTask::Disabled
@@ -255,8 +490,41 @@ impl Executor {
     /// This is called after the stream finishes to perform memory mutations.
     pub async fn complete_stream(&self, memory_task: MemoryUpdateTask, collected_response: &str) {
         match memory_task {
-            MemoryUpdateTask::Enabled { persona_name, messages, memory_config } => {
-                self.update_memory(&persona_name, &messages, collected_response, &memory_config).await;
+            MemoryUpdateTask::Enabled { persona_name, messages, memory_config, user_decision } => {
+                // Extract last user message for decision making
+                let last_user_msg = messages.last()
+                    .map(|m| m.content.clone())
+                    .unwrap_or_else(|| "".to_string());
+
+                // Make decision for streaming response
+                let stream_decision_ctx = self.create_decision_context(
+                    &persona_name,
+                    None, // memory_update not available in complete_stream
+                    &last_user_msg,
+                    collected_response,
+                    true, // was streaming
+                );
+                let stream_decision = EmbeddingDecisionMatrix::decide(
+                    MemoryEventKind::AssistantPlainText,
+                    &stream_decision_ctx,
+                    &memory_config,
+                );
+
+                if memory_config.debug {
+                    tracing::info!("🧠 Stream completion decision: {} ({})", stream_decision.reason, stream_decision.tags.join(","));
+                }
+
+                // Update memory only if streaming decision allows
+                if stream_decision.should_store_memory {
+                    self.update_memory_with_decision(
+                        &persona_name,
+                        &messages,
+                        collected_response,
+                        &memory_config,
+                        &user_decision,
+                        &stream_decision,
+                    ).await;
+                }
             }
             MemoryUpdateTask::Disabled => {
                 // No memory update needed
@@ -333,6 +601,60 @@ impl Executor {
         }
     }
 
+    /// Retrieve memory context respecting embedding decision
+    async fn retrieve_memory_context_with_decision(
+        &self,
+        messages: &[ChatMessage],
+        persona_name: &str,
+        memory_config: &MemoryConfig,
+        user_decision: &DecisionResult,
+    ) -> String {
+        // Extract last user message for memory retrieval
+        let last_user_msg = messages.last()
+            .map(|m| m.content.clone())
+            .unwrap_or_else(|| "".to_string());
+
+        // Compute embedding only if decision allows
+        let embedding = if user_decision.should_embed_input && !memory_config.vector_types.is_empty() && self.embeddings_available {
+            match self.embedding_model.infer(&last_user_msg).await {
+                Ok(emb) => Some(emb),
+                Err(e) => {
+                    if memory_config.debug {
+                        println!("[MEMORY] Failed to compute embedding: {}", e);
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let pm = self.persona_memory.lock().unwrap();
+
+        // Get keyword-based memory (always available for reading)
+        let keyword_memory = pm.build_retrieved_memory_context(persona_name, &last_user_msg, memory_config)
+            .unwrap_or_default();
+
+        // Get vector-based memory only if embedding was computed
+        let vector_memory = if let Some(ref emb) = embedding {
+            pm.build_vector_memory_context(persona_name, emb, memory_config)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        // Combine memories
+        if keyword_memory.is_empty() && vector_memory.is_empty() {
+            String::new()
+        } else if keyword_memory.is_empty() {
+            vector_memory
+        } else if vector_memory.is_empty() {
+            keyword_memory
+        } else {
+            format!("{}\n\n{}", keyword_memory, vector_memory)
+        }
+    }
+
     async fn update_memory(
         &self,
         persona_name: &str,
@@ -359,6 +681,47 @@ impl Executor {
         let _ = self.persona_memory.lock().unwrap()
             .update_memory_with_embedding_sync(
                 MemoryType::Conversation,
+                persona_name,
+                &last_user_msg,
+                response,
+                memory_config,
+                embedding.as_deref()
+            );
+    }
+
+    /// Update memory respecting embedding and storage decisions
+    async fn update_memory_with_decision(
+        &self,
+        persona_name: &str,
+        messages: &[ChatMessage],
+        response: &str,
+        memory_config: &MemoryConfig,
+        user_decision: &DecisionResult,
+        response_decision: &DecisionResult,
+    ) {
+        // Extract last user message for memory storage
+        let last_user_msg = messages.last()
+            .map(|m| m.content.clone())
+            .unwrap_or_else(|| "".to_string());
+
+        // Compute embedding only if both decisions allow embedding
+        let embedding = if user_decision.should_embed_input || response_decision.should_embed_output {
+            if self.embeddings_available {
+                match self.embedding_model.infer(&last_user_msg).await {
+                    Ok(emb) => Some(emb),
+                    Err(_e) => None, // Fail silently for memory updates
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Update memory with the decided memory type and embedding
+        let _ = self.persona_memory.lock().unwrap()
+            .update_memory_with_embedding_sync(
+                response_decision.memory_type,
                 persona_name,
                 &last_user_msg,
                 response,
@@ -414,6 +777,7 @@ pub enum MemoryUpdateTask {
         persona_name: String,
         messages: Vec<ChatMessage>,
         memory_config: MemoryConfig,
+        user_decision: DecisionResult,
     },
     Disabled,
 }

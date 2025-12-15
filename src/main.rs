@@ -18,6 +18,7 @@ mod system_prompt;
 mod persona_memory;
 mod llm_registry;
 mod executor;
+mod embedding_decision;
 mod toolport;
 mod tools {
     pub mod echo;
