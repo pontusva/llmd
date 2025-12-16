@@ -1,0 +1,199 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "IntentEnvelope",
+  "type": "object",
+  "required": [
+    "intent"
+  ],
+  "properties": {
+    "intent": {
+      "$ref": "#/definitions/Intent"
+    }
+  },
+  "definitions": {
+    "Action": {
+      "type": "string",
+      "enum": [
+        "List",
+        "Count",
+        "Get",
+        "Aggregate",
+        "Exists"
+      ]
+    },
+    "Filters": {
+      "type": "object",
+      "properties": {
+        "building_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "completed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "component_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verified": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "year_max": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "year_min": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        }
+      }
+    },
+    "GroupBy": {
+      "type": "string",
+      "enum": [
+        "Building",
+        "RealEstate",
+        "ComponentType"
+      ]
+    },
+    "Intent": {
+      "type": "object",
+      "required": [
+        "action",
+        "scope",
+        "target"
+      ],
+      "properties": {
+        "action": {
+          "$ref": "#/definitions/Action"
+        },
+        "attribute": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filters": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Filters"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "group_by": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GroupBy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "metric": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Metric"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope": {
+          "$ref": "#/definitions/Scope"
+        },
+        "target": {
+          "$ref": "#/definitions/Target"
+        }
+      }
+    },
+    "Metric": {
+      "type": "string",
+      "enum": [
+        "count",
+        "sum",
+        "avg",
+        "totalFloorArea",
+        "sumCost",
+        "avgCondition",
+        "energyCosts"
+      ]
+    },
+    "Scope": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "building_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "real_estate_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "$ref": "#/definitions/ScopeType"
+        }
+      }
+    },
+    "ScopeType": {
+      "type": "string",
+      "enum": [
+        "current_team",
+        "building",
+        "real_estate"
+      ]
+    },
+    "Target": {
+      "type": "string",
+      "enum": [
+        "building",
+        "component",
+        "realEstate",
+        "measure",
+        "plan",
+        "project"
+      ]
+    }
+  }
+}

@@ -12,6 +12,7 @@ async fn main() -> anyhow::Result<()> {
     let mut arg_model: Option<String> = None;
     let mut arg_persona: Option<String> = None;
     let mut arg_list_models: bool = false;
+    let mut memory_enabled: bool = false; // Default: memory disabled
     let mut i = 1; // Skip program name
 
     while i < args.len() {
@@ -30,6 +31,12 @@ async fn main() -> anyhow::Result<()> {
             }
             "--list-models" => {
                 arg_list_models = true;
+            }
+            "--memory" => {
+                memory_enabled = true;
+            }
+            "--no-memory" => {
+                memory_enabled = false; // Explicit disable (already default)
             }
             _ => {}
         }
@@ -127,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
     println!("🤖 Chat with LLM (tools enabled) — type /exit to quit");
     println!("🧠 Using LLM: {}", model);
     println!("👤 Using persona: {}", persona);
+    println!("💾 Memory: {}", if memory_enabled { "enabled" } else { "disabled" });
 
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
@@ -153,12 +161,18 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Make non-streaming HTTP request
+        let memory_update = if memory_enabled {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String("disable".to_string())
+        };
+
         let payload = json!({
             "model": model.clone(),
             "messages": [{"role": "user", "content": input}],
             "stream": false,
             "persona": persona.clone(),
-            "memory_update": "disable"
+            "memory_update": memory_update
         });
 
         match client

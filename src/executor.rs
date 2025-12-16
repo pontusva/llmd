@@ -1,12 +1,19 @@
 use std::sync::Arc;
+use crate::embedding_observability::EmbeddingStats;
 use crate::llm::{LlmModelTrait, GenerateOptions, ChatMessage};
 use crate::persona_memory::{IntelligentMemory, MemoryConfig, MemoryType, MemoryMode, MemoryPolicy};
 use crate::system_prompt::SystemPromptManager;
 use crate::model::Model;
-use crate::toolport::{ToolRegistry, parse_tool_call};
+use crate::toolport::{ToolRegistry, parse_tool_call, ToolEligibilityContext};
 use crate::embedding_decision::{EmbeddingDecisionMatrix, MemoryEventKind, DecisionContext, DecisionResult};
+use crate::tools::graphql::NameResolutionRegistry;
 use futures::Stream;
 use serde_json;
+
+/// Executor context containing per-request dependencies
+pub struct ExecutorContext {
+    pub name_registry: Arc<dyn NameResolutionRegistry + Send + Sync>,
+}
 
 /// Executor owns execution authority and agent state mutations.
 /// It decides when inference runs and is the only component that mutates memory state.
@@ -21,6 +28,10 @@ pub struct Executor {
     persona_memory: Arc<std::sync::Mutex<IntelligentMemory>>,
     /// Reference to tool registry (EXECUTION AUTHORITY)
     tool_registry: Arc<ToolRegistry>,
+    /// Name resolution registry for building/real estate names
+    name_registry: Arc<dyn NameResolutionRegistry + Send + Sync>,
+    /// Embedding observability and metrics
+    embedding_stats: Arc<EmbeddingStats>,
 }
 
 impl Executor {
@@ -28,6 +39,73 @@ impl Executor {
     fn looks_like_json(text: &str) -> bool {
         let trimmed = text.trim();
         trimmed.starts_with('{') || trimmed.starts_with("```json") || trimmed.starts_with("```")
+    }
+
+
+
+    /// Tool eligibility gate - determines if a specific tool call is appropriate for the conversation
+    fn is_tool_eligible(tool_name: &str, user_text: &str, assistant_text: &str) -> bool {
+        match tool_name {
+            "echo" => Self::is_echo_tool_eligible(user_text),
+            // Add other tool-specific eligibility checks here as needed
+            _ => true, // Other tools are eligible by default
+        }
+    }
+
+    /// Check if echo tool usage is appropriate for the given user input
+    fn is_echo_tool_eligible(user_text: &str) -> bool {
+        let trimmed = user_text.trim().to_lowercase();
+
+        // Echo is ONLY eligible if user explicitly requests tool usage
+        const EXPLICIT_REQUESTS: &[&str] = &[
+            "use the echo tool",
+            "call echo",
+            "echo this",
+            "echo:",
+        ];
+
+        for &request in EXPLICIT_REQUESTS {
+            if trimmed.contains(request) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Check if a tool was explicitly requested in the user message
+    fn is_tool_explicitly_requested(tool_name: &str, user_text: &str) -> bool {
+        match tool_name {
+            "echo" => Self::is_echo_tool_eligible(user_text),
+            // Add other tools here as needed
+            _ => false, // Default to not explicitly requested for unknown tools
+        }
+    }
+
+    /// Validate echo tool arguments - must be {"message": "<exact user-provided text>"}
+    fn validate_echo_tool_arguments(arguments: &serde_json::Value) -> bool {
+        // Must be an object
+        let obj = match arguments.as_object() {
+            Some(obj) => obj,
+            None => return false,
+        };
+
+        // Must have exactly one key: "message"
+        if obj.len() != 1 {
+            return false;
+        }
+
+        // Must have "message" key
+        let message_value = match obj.get("message") {
+            Some(val) => val,
+            None => return false,
+        };
+
+        // Must be a non-empty string
+        match message_value.as_str() {
+            Some(s) => !s.trim().is_empty(),
+            None => false,
+        }
     }
 
     /// Create a DecisionContext for the embedding decision matrix
@@ -73,7 +151,7 @@ impl Executor {
             } else {
                 let tools_list = available_tools.join(", ");
                 let enhanced = format!(
-                    "You are running inside the llmd runtime.\n\nYou do NOT execute tools yourself.\nYou only decide WHETHER a tool should be used.\n\nIf a user request requires an external capability, you MUST respond with a single JSON object describing a tool call.\nIf no tool is needed, respond normally in natural language.\n\nWhen calling a tool, respond with ONLY valid JSON.\nDo NOT include explanations, prose, markdown, or code fences.\n\nThe JSON MUST have this exact shape:\n{{\n  \"type\": \"tool_call\",\n  \"name\": \"<tool_name>\",\n  \"arguments\": {{ ... }}\n}}\n\nAvailable tools: {}\n\nRules:\n- Output must be valid JSON\n- No trailing text\n- No partial JSON\n- No extra fields\n- \"type\" MUST equal \"tool_call\"\n\nIf unsure, DO NOT call a tool.",
+                    "You are an Intent Compiler.\n\nYour ONLY task is to translate user questions into a STRICT Intent JSON that conforms EXACTLY to the provided schema and rules.\n\nYou do NOT reason about dates, years, or time ranges.\nYou do NOT invent filters.\nYou do NOT infer temporal constraints.\n\n────────────────────────────────────\nABSOLUTE RULES (NON-NEGOTIABLE)\n────────────────────────────────────\n\n1. You MUST output a tool_call JSON or plain text — nothing else.\n\n2. You MUST NEVER:\n   - invent filter keys (e.g. \"date\", \"time\", \"year\")\n   - encode years, ranges, or time in the intent\n   - use scope for time\n   - use aggregate when count is sufficient\n\n3. Time expressions like:\n   - \"in 2025\"\n   - \"last year\"\n   - \"this year\"\n   - \"between 2020 and 2023\"\n\n   MUST be ignored completely.\n\n   They are handled later by the backend.\n   You MUST NOT encode them.\n\n4. If the user asks \"How many X\":\n   - action = \"count\"\n   - NEVER \"aggregate\" unless explicitly asked for sum/avg/etc.\n\n5. Status words:\n   - \"completed\", \"open\", \"incomplete\"\n   MUST go into:\n     filters.status\n\n6. Valid targets ONLY:\n   building, component, realEstate, measure, plan, project\n\n7. Physical things (windows, doors, rooms, pipes):\n   - MUST be attributes\n   - MUST NOT be targets\n\n────────────────────────────────────\nCORRECT EXAMPLE\n────────────────────────────────────\n\nUser:\n\"How many measures were completed in 2025?\"\n\nYou MUST produce:\n\n{{\n  \"type\": \"tool_call\",\n  \"name\": \"query_intent\",\n  \"arguments\": {{\n    \"intent\": {{\n      \"action\": \"count\",\n      \"target\": \"measure\",\n      \"scope\": {{ \"type\": \"current_team\" }},\n      \"filters\": {{\n        \"status\": \"completed\"\n      }}\n    }}\n  }}\n}}\n\n────────────────────────────────────\nINCORRECT (FORBIDDEN)\n────────────────────────────────────\n\n❌ filters.date\n❌ filters.year\n❌ scope.year\n❌ aggregate + metric=count\n❌ guessing backend behavior\n\nIf you violate ANY rule, the request will be rejected.\n\nAvailable tools: {}",
                     tools_list
                 );
                 Some(enhanced)
@@ -108,6 +186,8 @@ impl Executor {
         system_prompt: SystemPromptManager,
         persona_memory: Arc<std::sync::Mutex<IntelligentMemory>>,
         tool_registry: Arc<ToolRegistry>,
+        name_registry: Arc<dyn NameResolutionRegistry + Send + Sync>,
+        embedding_stats: Arc<EmbeddingStats>,
     ) -> Self {
         Self {
             embedding_model,
@@ -115,6 +195,8 @@ impl Executor {
             system_prompt,
             persona_memory,
             tool_registry,
+            name_registry,
+            embedding_stats,
         }
     }
 
@@ -151,6 +233,7 @@ impl Executor {
             MemoryEventKind::UserMessage,
             &user_decision_ctx,
             &memory_config,
+            &self.embedding_stats,
         );
 
         // Log decision if debug enabled
@@ -184,39 +267,101 @@ impl Executor {
 
         // Parse model output for tool calls
         if let Some(tool_call) = parse_tool_call(&reply) {
-            // Tool call detected - make decision for tool call JSON
-            let tool_call_decision_ctx = self.create_decision_context(
-                persona_name,
-                memory_update,
-                &last_user_msg,
-                &reply,
-                false,
-            );
-            let tool_call_decision = EmbeddingDecisionMatrix::decide(
-                MemoryEventKind::AssistantToolCallJson,
-                &tool_call_decision_ctx,
-                &memory_config,
-            );
-
-            if memory_config.debug {
-                tracing::info!("🧠 Tool call decision: {} ({})", tool_call_decision.reason, tool_call_decision.tags.join(","));
-            }
-
-            // Tool call detected - validate against whitelist
+            // Tool call detected - validate tool registry and eligibility
             tracing::info!("Tool call detected: {} with arguments {:?}", tool_call.name, tool_call.arguments);
 
             // Tool execution whitelisting: only execute registered tools
-            if let Some(tool) = self.tool_registry.get(&tool_call.name) {
-                // Tool is whitelisted, execute it
+            let tool = match self.tool_registry.get(&tool_call.name) {
+                Some(t) => t,
+                None => {
+                    // Unknown tool → jail retry (hallucinated tool name)
+                    tracing::warn!("Rejected unknown tool call: {} (not in registry)", tool_call.name);
+                    let jail_reply = self.execute_jail_retry(llm, &messages, persona, &options).await?;
+                    let safe_reply = Self::strip_chatml(&jail_reply);
+                    return Ok(safe_reply);
+                }
+            };
+
+            // Parse Intent for eligibility checking (only for query_intent tool)
+            let parsed_intent = if tool_call.name == "query_intent" {
+                // Parse the intent from tool arguments
+                match crate::tools::graphql::IntentQueryTool::parse_intent(&tool_call.arguments.args) {
+                    Ok(mut intent) => {
+                        // Apply time and status filter normalization from user message
+                        crate::tools::graphql::IntentQueryTool::normalize_time_and_status_filters(
+                            &mut intent,
+                            &last_user_msg
+                        );
+                        Some(intent)
+                    },
+                    Err(_) => {
+                        tracing::warn!(
+                            "Invalid intent payload in tool call '{}' - rejecting without jail retry",
+                            tool_call.name
+                        );
+                        // Invalid intent = hard stop, no jail retry for malformed intents
+                        let safe_reply = Self::strip_chatml(&reply);
+                        return Ok(safe_reply);
+                    }
+                }
+            } else {
+                None // Other tools don't use Intent
+            };
+
+            // Debug log filters before eligibility check
+            if let Some(ref intent) = parsed_intent {
+                if let Some(ref filters) = intent.filters {
+                    tracing::info!("🔍 Intent filters before eligibility: {:?}", filters);
+                }
+            }
+
+            // Check tool eligibility FIRST - this is the single source of truth for intent
+            let explicitly_requested = Self::is_tool_explicitly_requested(&tool_call.name, &last_user_msg);
+            let eligibility_ctx = ToolEligibilityContext {
+                user_message: &last_user_msg,
+                assistant_message: &reply,
+                explicitly_requested,
+                persona: persona_name,
+                intent: parsed_intent.as_ref(),
+            };
+
+            if !tool.is_eligible(&eligibility_ctx) {
+                tracing::info!(
+                    "Tool call ignored: '{}' not eligible for message '{}' - treating as plain text",
+                    tool_call.name,
+                    last_user_msg
+                );
+                // Tool call not eligible - treat model output as plain text, no jail retry
+                // Fall through to plain text processing below
+            } else {
+                // Tool is eligible - proceed directly to validation and execution
+                // NO further intent checks by executor - ToolEligibility is authoritative
+
+                // Additional validation for echo tool arguments
+                if tool_call.name == "echo" && !Self::validate_echo_tool_arguments(&tool_call.arguments.args) {
+                    tracing::warn!("Echo tool rejected: invalid arguments {:?}", tool_call.arguments.args);
+                    let jail_reply = self.execute_jail_retry(llm, &messages, persona, &options).await?;
+                    let safe_reply = Self::strip_chatml(&jail_reply);
+                    return Ok(safe_reply);
+                }
+
+                // Tool is eligible and arguments are valid, execute it
                 let tool_input = crate::toolport::ToolInput {
                     payload: tool_call.arguments.args,
                     metadata: crate::toolport::ToolMetadata {
                         tool_name: tool_call.name.clone(),
                     },
+                    user_message: last_user_msg.clone(),
                 };
 
-                tracing::info!("Executing whitelisted tool: {}", tool_call.name);
-                match tool.execute(tool_input) {
+                tracing::info!("Executing eligible tool: {}", tool_call.name);
+
+                // Create executor context with injected name registry
+                let executor_ctx = ExecutorContext {
+                    name_registry: self.name_registry.clone(),
+                };
+
+                match tool.execute(tool_input, &executor_ctx) {
                     Ok(tool_output) => {
                         tracing::info!("Tool execution succeeded: {}", tool_call.name);
                         // Tool results are always safe - strip ChatML and return
@@ -236,6 +381,7 @@ impl Executor {
                             MemoryEventKind::ToolResult,
                             &tool_result_decision_ctx,
                             &memory_config,
+                            &self.embedding_stats,
                         );
 
                         if memory_config.debug {
@@ -258,80 +404,12 @@ impl Executor {
                     }
                     Err(tool_error) => {
                         tracing::warn!("Tool execution failed: {} - {:?}", tool_call.name, tool_error);
-                        // Jail retry for failed tool execution
+                        // Jail retry for failed tool execution (actual execution error, not intent)
                         let jail_reply = self.execute_jail_retry(llm, &messages, persona, &options).await?;
                         let safe_reply = Self::strip_chatml(&jail_reply);
-
-                        // Make decision for jail retry response
-                        let jail_decision_ctx = self.create_decision_context(
-                            persona_name,
-                            memory_update,
-                            &last_user_msg,
-                            &safe_reply,
-                            false,
-                        );
-                        let jail_decision = EmbeddingDecisionMatrix::decide(
-                            MemoryEventKind::JailRetryPlainText,
-                            &jail_decision_ctx,
-                            &memory_config,
-                        );
-
-                        if memory_config.debug {
-                            tracing::info!("🧠 Jail retry decision: {} ({})", jail_decision.reason, jail_decision.tags.join(","));
-                        }
-
-                        // Update memory for jail retry if decision allows
-                        if jail_decision.should_store_memory {
-                            self.update_memory_with_decision(
-                                persona_name,
-                                &messages,
-                                &safe_reply,
-                                &memory_config,
-                                &user_decision,
-                                &jail_decision,
-                            ).await;
-                        }
-
                         return Ok(safe_reply);
                     }
                 }
-            } else {
-                // Tool not whitelisted - reject and jail retry
-                tracing::warn!("Rejected unknown tool call: {} (not in registry)", tool_call.name);
-                let jail_reply = self.execute_jail_retry(llm, &messages, persona, &options).await?;
-                let safe_reply = Self::strip_chatml(&jail_reply);
-
-                // Make decision for jail retry response
-                let jail_decision_ctx = self.create_decision_context(
-                    persona_name,
-                    memory_update,
-                    &last_user_msg,
-                    &safe_reply,
-                    false,
-                );
-                let jail_decision = EmbeddingDecisionMatrix::decide(
-                    MemoryEventKind::JailRetryPlainText,
-                    &jail_decision_ctx,
-                    &memory_config,
-                );
-
-                if memory_config.debug {
-                    tracing::info!("🧠 Jail retry decision: {} ({})", jail_decision.reason, jail_decision.tags.join(","));
-                }
-
-                // Update memory for jail retry if decision allows
-                if jail_decision.should_store_memory {
-                    self.update_memory_with_decision(
-                        persona_name,
-                        &messages,
-                        &safe_reply,
-                        &memory_config,
-                        &user_decision,
-                        &jail_decision,
-                    ).await;
-                }
-
-                return Ok(safe_reply);
             }
         }
 
@@ -354,6 +432,7 @@ impl Executor {
                 MemoryEventKind::JailRetryViolation,
                 &jail_violation_decision_ctx,
                 &memory_config,
+                &self.embedding_stats,
             );
 
             if memory_config.debug {
@@ -388,6 +467,7 @@ impl Executor {
             MemoryEventKind::AssistantPlainText,
             &assistant_decision_ctx,
             &memory_config,
+            &self.embedding_stats,
         );
 
         if memory_config.debug {
@@ -447,6 +527,7 @@ impl Executor {
             MemoryEventKind::UserMessage,
             &user_decision_ctx,
             &memory_config,
+            &self.embedding_stats,
         );
 
         if memory_config.debug {
@@ -508,6 +589,7 @@ impl Executor {
                     MemoryEventKind::AssistantPlainText,
                     &stream_decision_ctx,
                     &memory_config,
+                    &self.embedding_stats,
                 );
 
                 if memory_config.debug {
@@ -707,8 +789,15 @@ impl Executor {
         // Compute embedding only if both decisions allow embedding
         let embedding = if user_decision.should_embed_input || response_decision.should_embed_output {
             if self.embeddings_available {
+                let start = std::time::Instant::now();
                 match self.embedding_model.infer(&last_user_msg).await {
-                    Ok(emb) => Some(emb),
+                    Ok(emb) => {
+                        let latency_ms = start.elapsed().as_millis() as u64;
+                        let vector_dim = emb.len();
+                        self.embedding_stats.embedded_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::info!("🧮 embedding computed: latency_ms={}, vector_dim={}, ttl_seconds={:?}", latency_ms, vector_dim, response_decision.ttl_seconds);
+                        Some(emb)
+                    }
                     Err(_e) => None, // Fail silently for memory updates
                 }
             } else {
@@ -780,4 +869,78 @@ pub enum MemoryUpdateTask {
         user_decision: DecisionResult,
     },
     Disabled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_validate_echo_tool_arguments_valid() {
+        let valid_args = json!({"message": "hello world"});
+        assert!(Executor::validate_echo_tool_arguments(&valid_args));
+    }
+
+    #[test]
+    fn test_validate_echo_tool_arguments_wrong_key() {
+        let invalid_args = json!({"input": "hello world"});
+        assert!(!Executor::validate_echo_tool_arguments(&invalid_args));
+    }
+
+    #[test]
+    fn test_validate_echo_tool_arguments_empty_object() {
+        let invalid_args = json!({});
+        assert!(!Executor::validate_echo_tool_arguments(&invalid_args));
+    }
+
+    #[test]
+    fn test_validate_echo_tool_arguments_wrong_type() {
+        let invalid_args = json!({"message": 123});
+        assert!(!Executor::validate_echo_tool_arguments(&invalid_args));
+    }
+
+    #[test]
+    fn test_validate_echo_tool_arguments_empty_string() {
+        let invalid_args = json!({"message": ""});
+        assert!(!Executor::validate_echo_tool_arguments(&invalid_args));
+    }
+
+    #[test]
+    fn test_validate_echo_tool_arguments_whitespace_string() {
+        let invalid_args = json!({"message": "   "});
+        assert!(!Executor::validate_echo_tool_arguments(&invalid_args));
+    }
+
+    #[test]
+    fn test_validate_echo_tool_arguments_extra_keys() {
+        let invalid_args = json!({"message": "hello", "extra": "field"});
+        assert!(!Executor::validate_echo_tool_arguments(&invalid_args));
+    }
+
+
+    #[test]
+    fn test_is_tool_eligible_echo_explicit_requests() {
+        // Echo should be eligible when user explicitly requests it
+        assert!(Executor::is_tool_eligible("echo", "use the echo tool", ""));
+        assert!(Executor::is_tool_eligible("echo", "call echo", ""));
+        assert!(Executor::is_tool_eligible("echo", "echo this message", ""));
+        assert!(Executor::is_tool_eligible("echo", "please echo:", ""));
+    }
+
+    #[test]
+    fn test_is_tool_eligible_echo_inappropriate_usage() {
+        // Echo should NOT be eligible for casual conversation
+        assert!(!Executor::is_tool_eligible("echo", "hello", ""));
+        assert!(!Executor::is_tool_eligible("echo", "what do you think?", ""));
+        assert!(!Executor::is_tool_eligible("echo", "tell me about yourself", ""));
+        assert!(!Executor::is_tool_eligible("echo", "I love coding", ""));
+    }
+
+    #[test]
+    fn test_is_tool_eligible_other_tools() {
+        // Other tools should be eligible by default (for now)
+        assert!(Executor::is_tool_eligible("some_other_tool", "any message", ""));
+        assert!(Executor::is_tool_eligible("graphql_query", "hello", ""));
+    }
 }

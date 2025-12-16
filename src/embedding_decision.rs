@@ -1,4 +1,6 @@
+use crate::embedding_observability::EmbeddingStats;
 use crate::persona_memory::{MemoryConfig, MemoryMode, MemoryType};
+use std::sync::Arc;
 
 /// Events that trigger embedding/memory decisions in the Executor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +66,11 @@ impl EmbeddingDecisionMatrix {
         kind: MemoryEventKind,
         ctx: &DecisionContext,
         memory_config: &MemoryConfig,
+        stats: &Arc<EmbeddingStats>,
     ) -> DecisionResult {
+        // Track decision metrics
+        stats.decisions_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         // Global gates - apply to all events
 
         // 1. Memory disabled globally
@@ -97,14 +103,24 @@ impl EmbeddingDecisionMatrix {
         let can_embed = ctx.embeddings_available && ctx.has_vector_types;
 
         // Apply event-specific logic
-        match kind {
+        let result = match kind {
             MemoryEventKind::UserMessage => Self::decide_user_message(ctx, can_embed),
             MemoryEventKind::AssistantPlainText => Self::decide_assistant_plain_text(ctx, can_embed),
             MemoryEventKind::AssistantToolCallJson => Self::decide_assistant_tool_call_json(ctx),
             MemoryEventKind::ToolResult => Self::decide_tool_result(ctx, can_embed),
             MemoryEventKind::JailRetryPlainText => Self::decide_jail_retry_plain_text(ctx, can_embed),
             MemoryEventKind::JailRetryViolation => Self::decide_jail_retry_violation(),
+        };
+
+        // Track allowed/denied metrics
+        if result.should_store_memory {
+            stats.allowed_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            stats.denied_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!("🧠 embedding denied: {} ({})", result.reason, result.tags.join(","));
         }
+
+        result
     }
 
     /// Decide for user message events
@@ -404,7 +420,8 @@ mod tests {
             is_streaming: false,
         };
 
-        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::UserMessage, &ctx, &config);
+        let stats = Arc::new(EmbeddingStats::new());
+        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::UserMessage, &ctx, &config, &stats);
         assert!(!decision.should_store_memory);
         assert_eq!(decision.reason, "user input matches denylist");
         assert!(decision.tags.contains(&"denylist"));
@@ -423,7 +440,8 @@ mod tests {
             is_streaming: false,
         };
 
-        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::AssistantToolCallJson, &ctx, &config);
+        let stats = Arc::new(EmbeddingStats::new());
+        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::AssistantToolCallJson, &ctx, &config, &stats);
         assert!(!decision.should_store_memory);
         assert!(!decision.should_embed_input);
         assert!(!decision.should_embed_output);
@@ -443,7 +461,8 @@ mod tests {
             is_streaming: false,
         };
 
-        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::ToolResult, &ctx, &config);
+        let stats = Arc::new(EmbeddingStats::new());
+        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::ToolResult, &ctx, &config, &stats);
         assert!(decision.should_store_memory);
         assert!(!decision.should_embed_output); // keyword only
         assert_eq!(decision.ttl_seconds, Some(3600)); // 1 hour
@@ -463,7 +482,8 @@ mod tests {
             is_streaming: false,
         };
 
-        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::ToolResult, &ctx, &config);
+        let stats = Arc::new(EmbeddingStats::new());
+        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::ToolResult, &ctx, &config, &stats);
         assert!(!decision.should_store_memory);
         assert_eq!(decision.reason, "tool result - not memory safe or too large");
     }
@@ -482,7 +502,8 @@ mod tests {
         };
 
         // This should be detected as echo-like (exact match)
-        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::AssistantPlainText, &ctx, &config);
+        let stats = Arc::new(EmbeddingStats::new());
+        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::AssistantPlainText, &ctx, &config, &stats);
         assert!(!decision.should_store_memory);
         assert_eq!(decision.reason, "echo-like response");
     }
@@ -500,7 +521,8 @@ mod tests {
             is_streaming: false,
         };
 
-        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::UserMessage, &ctx, &config);
+        let stats = Arc::new(EmbeddingStats::new());
+        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::UserMessage, &ctx, &config, &stats);
         assert!(!decision.should_store_memory);
         assert!(!decision.should_embed_input);
         assert!(!decision.should_embed_output);
@@ -520,7 +542,8 @@ mod tests {
             is_streaming: false,
         };
 
-        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::AssistantPlainText, &ctx, &config);
+        let stats = Arc::new(EmbeddingStats::new());
+        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::AssistantPlainText, &ctx, &config, &stats);
         assert!(decision.should_store_memory);
         assert!(decision.should_embed_input);
         assert!(decision.should_embed_output);
@@ -543,7 +566,8 @@ mod tests {
             is_streaming: false,
         };
 
-        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::UserMessage, &ctx, &config);
+        let stats = Arc::new(EmbeddingStats::new());
+        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::UserMessage, &ctx, &config, &stats);
         assert!(!decision.should_store_memory);
         assert_eq!(decision.reason, "read-only mode");
     }
@@ -561,7 +585,8 @@ mod tests {
             is_streaming: false,
         };
 
-        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::JailRetryViolation, &ctx, &config);
+        let stats = Arc::new(EmbeddingStats::new());
+        let decision = EmbeddingDecisionMatrix::decide(MemoryEventKind::JailRetryViolation, &ctx, &config, &stats);
         assert!(!decision.should_store_memory);
         assert_eq!(decision.reason, "jail retry violation");
     }

@@ -1,4 +1,4 @@
-use crate::toolport::{ToolPort, ToolInput, ToolOutput, ToolError};
+use crate::toolport::{ToolPort, ToolInput, ToolOutput, ToolError, ToolEligibility, ToolEligibilityContext};
 
 /// EchoTool simply returns the input payload unchanged.
 ///
@@ -9,19 +9,19 @@ use crate::toolport::{ToolPort, ToolInput, ToolOutput, ToolError};
 /// - No access to inference, memory, or external systems
 pub struct EchoTool;
 
+impl ToolEligibility for EchoTool {
+    fn is_eligible(&self, ctx: &ToolEligibilityContext) -> bool {
+        ctx.explicitly_requested
+    }
+}
+
 impl ToolPort for EchoTool {
     fn name(&self) -> &str {
         "echo"
     }
 
-    fn execute(&self, input: ToolInput) -> Result<ToolOutput, ToolError> {
-        // Validate input payload is not null
-        if input.payload.is_null() {
-            return Err(ToolError::InvalidParameters(
-                "EchoTool requires a non-null payload".to_string()
-            ));
-        }
-
+    fn execute(&self, input: ToolInput, _ctx: &crate::executor::ExecutorContext) -> Result<ToolOutput, ToolError> {
+        // EchoTool expects a string payload (validated by executor)
         // Return the input payload unchanged
         Ok(ToolOutput {
             payload: input.payload,

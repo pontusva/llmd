@@ -1,3 +1,4 @@
+use crate::embedding_observability::EmbeddingStats;
 use crate::executor::Executor;
 use crate::llm::LlmModelTrait;
 use crate::llm_factory::build_llm_from_env;
@@ -7,6 +8,7 @@ use crate::persona_memory::IntelligentMemory;
 use crate::storage::Storage;
 use crate::system_prompt::SystemPromptManager;
 use crate::toolport::ToolRegistry;
+use crate::tools::graphql::NameResolutionRegistry;
 use crate::vector_store::VectorStore;
 
 use model_loader_core::plan::{LoadPlan, LoadStep};
@@ -31,8 +33,14 @@ pub struct AppState {
     /// Tool registry for external capabilities
     pub tools: Arc<ToolRegistry>,
 
+    /// Name resolution registry for building/real estate names
+    pub name_registry: Arc<dyn NameResolutionRegistry + Send + Sync>,
+
     /// Executor owns execution authority and memory mutation
     pub executor: Arc<Executor>,
+
+    /// Embedding observability and metrics
+    pub embedding_stats: Arc<EmbeddingStats>,
 }
 
 impl AppState {
@@ -181,6 +189,20 @@ impl AppState {
 
         let model_arc = Arc::new(model);
         let system_prompt = SystemPromptManager::new();
+        let embedding_stats = Arc::new(EmbeddingStats::new());
+
+        // Initialize name resolution registry once at startup
+        let name_registry: Arc<dyn NameResolutionRegistry + Send + Sync> = Arc::new(
+            crate::tools::graphql::InMemoryNameRegistry::new(
+                vec![
+                    ("Räven".to_string(), "building-123".to_string(), "Räven".to_string()),
+                    ("Björk".to_string(), "building-456".to_string(), "Björk".to_string()),
+                ],
+                vec![
+                    ("RealEstate1".to_string(), "real-estate-123".to_string(), "Real Estate 1".to_string()),
+                ],
+            )
+        );
 
         let executor = Arc::new(Executor::new(
             model_arc.clone(),
@@ -188,6 +210,8 @@ impl AppState {
             system_prompt.clone(),
             persona_memory.clone(),
             tool_registry.clone(),
+            name_registry.clone(),
+            embedding_stats.clone(),
         ));
 
         Ok(Self {
@@ -199,7 +223,9 @@ impl AppState {
             system_prompt,
             persona_memory,
             tools: tool_registry,
+            name_registry,
             executor,
+            embedding_stats,
         })
     }
 }

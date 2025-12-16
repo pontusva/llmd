@@ -4,6 +4,7 @@ use std::sync::Arc;
 use model_loader_core::plan::LoadPlan;
 use crate::toolport::ToolRegistry;
 use crate::tools::echo::EchoTool;
+use crate::tools::graphql::IntentQueryTool;
 
 mod model;
 mod routes;
@@ -19,9 +20,12 @@ mod persona_memory;
 mod llm_registry;
 mod executor;
 mod embedding_decision;
+mod embedding_observability;
 mod toolport;
+pub mod schema;
 mod tools {
     pub mod echo;
+    pub mod graphql;
 }
 
 use std::io::{self, Read};
@@ -80,6 +84,16 @@ async fn main() {
     // --- initialize tool registry and register all tools
     let mut tool_registry = ToolRegistry::new();
     tool_registry.register(EchoTool);
+
+    // Initialize name resolution registry with empty lists for now
+    // TODO: Load actual building/real estate names from configuration or database
+    let name_registry = crate::tools::graphql::InMemoryNameRegistry::new(
+        vec![], // buildings
+        vec![], // real_estates
+    );
+    tool_registry.register(crate::tools::graphql::IntentQueryTool::new(
+        Box::new(name_registry)
+    ));
     let tool_registry = Arc::new(tool_registry);
 
     // --- initialize app state based on backend

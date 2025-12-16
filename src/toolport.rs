@@ -2,6 +2,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Context for tool eligibility decisions
+#[derive(Debug)]
+pub struct ToolEligibilityContext<'a> {
+    /// The user's message that triggered the tool call
+    pub user_message: &'a str,
+    /// The assistant's message containing the tool call
+    pub assistant_message: &'a str,
+    /// Whether the user explicitly requested this tool by name
+    pub explicitly_requested: bool,
+    /// The persona being used
+    pub persona: &'a str,
+    /// The parsed intent (if successfully parsed)
+    pub intent: Option<&'a crate::tools::graphql::Intent>,
+}
+
+/// Trait for tools to determine their own eligibility
+pub trait ToolEligibility: Send + Sync {
+    fn is_eligible(&self, ctx: &ToolEligibilityContext) -> bool;
+}
+
 /// Metadata for tool execution
 #[derive(Debug, Clone)]
 pub struct ToolMetadata {
@@ -16,6 +36,7 @@ pub struct ToolInput {
     pub payload: Value,
     /// Tool execution metadata
     pub metadata: ToolMetadata,
+    pub user_message: String,
 }
 
 /// Output from tool execution
@@ -43,18 +64,24 @@ pub enum ToolError {
 /// They do NOT access inference or memory - those are separate concerns.
 ///
 /// The Executor is the only caller of ToolPort implementations.
-pub trait ToolPort {
+pub trait ToolPort: ToolEligibility {
     /// Returns the name of this tool
     fn name(&self) -> &str;
+
+    /// Returns whether this tool is read-only (safe for mixed-intent messages)
+    fn is_read_only(&self) -> bool {
+        false // Default implementation - tools are not read-only unless explicitly marked
+    }
 
     /// Execute the tool with the given input
     ///
     /// # Arguments
     /// * `input` - The tool input containing name and parameters
+    /// * `ctx` - Executor context containing per-request dependencies
     ///
     /// # Returns
     /// ToolOutput on success, ToolError on failure
-    fn execute(&self, input: ToolInput) -> Result<ToolOutput, ToolError>;
+    fn execute(&self, input: ToolInput, ctx: &crate::executor::ExecutorContext) -> Result<ToolOutput, ToolError>;
 }
 
 /// ToolRegistry maps tool names to ToolPort implementations
