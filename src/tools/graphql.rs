@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use schemars::JsonSchema;
 use crate::core::schema;
+use crate::core::relation_map;
 
 
 
@@ -567,7 +568,7 @@ pub enum Action {
 /// Supported target types (ROOT ENTITIES ONLY)
 /// This is the grammar-level enum - capabilities decide which combinations are supported
 /// ONLY root domain entities are allowed - nested objects must be attributes
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum Target {
     /// Physical building structures
@@ -790,16 +791,22 @@ impl IntentQueryTool {
 pub struct Scope {
     /// Scope type discriminator
     pub r#type: ScopeType,
-    /// Building name (only when type is "building")
+    /// Building ID (only when type is "building") - resolved during normalization
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub building_id: Option<String>,
+    /// Real estate ID (only when type is "realEstate") - resolved during normalization
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub real_estate_id: Option<String>,
+    /// LEGACY: Building name - kept for backward compatibility during transition
     #[serde(skip_serializing_if = "Option::is_none")]
     pub building_name: Option<String>,
-    /// Real estate name (only when type is "realEstate")
+    /// LEGACY: Real estate name - kept for backward compatibility during transition
     #[serde(skip_serializing_if = "Option::is_none")]
     pub real_estate_name: Option<String>,
 }
 
 /// Scope type discriminator (grammar level)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeType {
     CurrentTeam,
@@ -1024,30 +1031,71 @@ impl IntentQueryTool {
 
     /// Normalize building scope based on explicit user message references
     /// Uses authoritative name resolution to confirm extracted building names
-    fn normalize_explicit_building_scope(
-        &self,
+    /// FAILS if building name is referenced but cannot be resolved
+    pub fn normalize_building_scope_with_early_failure(
         intent: &mut Intent,
         user_message: &str,
         registry: &dyn NameResolutionRegistry,
-    ) {
+    ) -> Result<(), ToolError> {
         // Only override current_team scope
         if !matches!(intent.scope.r#type, ScopeType::CurrentTeam) {
-            return;
+            return Ok(());
         }
 
         let Some(candidate) = Self::extract_building_name_from_message(user_message) else {
-            return;
+            // No building reference found - keep current_team scope
+            return Ok(());
         };
 
-        let Some(resolved) = registry.resolve_building(&candidate) else {
-            return;
-        };
+        let resolved = registry.resolve_building(&candidate)
+            .ok_or_else(|| ToolError::InvalidParameters(
+                format!("Building '{}' not found", candidate)
+            ))?;
 
+        // Convert to building scope with resolved ID
         intent.scope = Scope {
             r#type: ScopeType::Building,
-            building_name: Some(resolved.name),
+            building_id: Some(resolved.id.clone()),
+            building_name: Some(resolved.name.clone()), // Keep name for display/debugging
+            real_estate_id: None,
             real_estate_name: None,
         };
+
+        Ok(())
+    }
+
+    /// LEGACY: Normalize building scope based on explicit user message references
+    /// Uses authoritative name resolution to confirm extracted building names
+    /// WARNING: This method silently ignores unknown buildings - DO NOT USE in new code
+    pub fn normalize_explicit_building_scope(
+        intent: &mut Intent,
+        user_message: &str,
+        registry: &dyn NameResolutionRegistry,
+    ) -> Result<(), ToolError> {
+        // Only override current_team scope
+        if !matches!(intent.scope.r#type, ScopeType::CurrentTeam) {
+            return Ok(());
+        }
+
+        let Some(candidate) = Self::extract_building_name_from_message(user_message) else {
+            return Ok(());
+        };
+
+        let resolved = registry.resolve_building(&candidate)
+            .ok_or_else(|| ToolError::InvalidParameters(
+                format!("Building '{}' not found", candidate)
+            ))?;
+
+        // Replace scope deterministically
+        intent.scope = Scope {
+            r#type: ScopeType::Building,
+            building_id: Some(resolved.id.clone()),
+            building_name: Some(resolved.name.clone()),
+            real_estate_id: None,
+            real_estate_name: None,
+        };
+
+        Ok(())
     }
 
     /// Extract building name from user message using conservative patterns
@@ -1175,33 +1223,37 @@ impl IntentQueryTool {
         // Validate scope structure (grammar-level only)
         match intent.scope.r#type {
             ScopeType::Building => {
-                if intent.scope.building_name.is_none() {
+                // Building scope requires either name (for parsing) or ID (after normalization)
+                if intent.scope.building_name.is_none() && intent.scope.building_id.is_none() {
                     return Err(ToolError::InvalidParameters(
-                        "Scope type 'building' requires 'building_name' field".to_string()
+                        "Scope type 'building' requires either 'building_name' or 'building_id' field".to_string()
                     ));
                 }
-                if intent.scope.real_estate_name.is_some() {
+                if intent.scope.real_estate_name.is_some() || intent.scope.real_estate_id.is_some() {
                     return Err(ToolError::InvalidParameters(
-                        "Scope type 'building' cannot have 'real_estate_name' field".to_string()
+                        "Scope type 'building' cannot have real estate fields".to_string()
                     ));
                 }
             },
             ScopeType::RealEstate => {
-                if intent.scope.real_estate_name.is_none() {
+                // Real estate scope requires either name (for parsing) or ID (after normalization)
+                if intent.scope.real_estate_name.is_none() && intent.scope.real_estate_id.is_none() {
                     return Err(ToolError::InvalidParameters(
-                        "Scope type 'realEstate' requires 'real_estate_name' field".to_string()
+                        "Scope type 'realEstate' requires either 'real_estate_name' or 'real_estate_id' field".to_string()
                     ));
                 }
-                if intent.scope.building_name.is_some() {
+                if intent.scope.building_name.is_some() || intent.scope.building_id.is_some() {
                     return Err(ToolError::InvalidParameters(
-                        "Scope type 'realEstate' cannot have 'building_name' field".to_string()
+                        "Scope type 'realEstate' cannot have building fields".to_string()
                     ));
                 }
             },
             ScopeType::CurrentTeam => {
-                if intent.scope.building_name.is_some() || intent.scope.real_estate_name.is_some() {
+                // CurrentTeam cannot have any name or ID fields
+                if intent.scope.building_name.is_some() || intent.scope.building_id.is_some() ||
+                   intent.scope.real_estate_name.is_some() || intent.scope.real_estate_id.is_some() {
                     return Err(ToolError::InvalidParameters(
-                        "Scope type 'current_team' cannot have name fields".to_string()
+                        "Scope type 'current_team' cannot have any name or ID fields".to_string()
                     ));
                 }
             },
@@ -1232,19 +1284,40 @@ impl IntentQueryTool {
     }
 
     /// Compile Intent to GraphQL query
-    fn compile_intent_to_graphql(intent: &Intent, ctx: &RequestContext) -> Result<String, ToolError> {
-        // Resolve scope to actual IDs
-        let scope_filter = Self::resolve_scope(&intent.scope, ctx)?;
+    fn compile_intent_to_graphql(
+        intent: &Intent,
+        ctx: &RequestContext,
+        registry: &dyn NameResolutionRegistry
+    ) -> Result<String, ToolError> {
+        // Resolve scope using RelationMap
+        let scope_constraint = Self::compile_scope_constraint(&intent.target, &intent.scope, ctx, registry)?;
 
         // Compile filters if present
-        let filters_clause = intent.filters.as_ref()
-            .and_then(|filters| Self::compile_filters(filters));
+        let filters_constraint = intent.filters.as_ref()
+            .and_then(|filters| Self::compile_filters_to_json(filters));
 
-        // Combine scope and filters with AND semantics
-        let where_clause = match (&scope_filter, &filters_clause) {
-            (scope, Some(filters)) => format!("{}, {}", scope, filters),
-            (scope, None) => scope.clone(),
+        // Combine scope and filters with AND semantics (merge JSON objects)
+        let where_json = match (&scope_constraint, &filters_constraint) {
+            (Some(scope), Some(filters)) => {
+                if let (serde_json::Value::Object(mut scope_obj), serde_json::Value::Object(filters_obj)) = (scope.clone(), filters.clone()) {
+                    for (k, v) in filters_obj {
+                        scope_obj.insert(k, v);
+                    }
+                    serde_json::Value::Object(scope_obj)
+                } else {
+                    scope.clone()
+                }
+            },
+            (Some(scope), None) => scope.clone(),
+            (None, Some(filters)) => filters.clone(),
+            (None, None) => serde_json::json!({}),
         };
+
+        // Convert to GraphQL where clause string
+        let where_clause = serde_json::to_string(&where_json)
+            .map_err(|e| ToolError::InvalidParameters(format!("Failed to serialize where clause: {}", e)))?
+            .trim_matches('"')
+            .to_string();
 
         // Build GraphQL query based on action and target
         let query_body = match (&intent.action, &intent.target, intent.attribute.as_deref()) {
@@ -1313,28 +1386,57 @@ impl IntentQueryTool {
         Ok(format!("query {{ {} }}", limited_query))
     }
 
-    /// Resolve scope to GraphQL filter conditions
-    fn resolve_scope(scope: &Scope, ctx: &RequestContext) -> Result<String, ToolError> {
+    /// Compile scope constraint using RelationMap
+    fn compile_scope_constraint(
+        target: &Target,
+        scope: &Scope,
+        ctx: &RequestContext,
+        registry: &dyn NameResolutionRegistry
+    ) -> Result<Option<serde_json::Value>, ToolError> {
         match &scope.r#type {
-            ScopeType::CurrentTeam => Ok(format!("teamId: \"{}\"", ctx.team_id)),
-            ScopeType::Building => {
-                let building_name = scope.building_name.as_ref()
-                    .ok_or_else(|| ToolError::InvalidParameters("Building scope requires building_name".to_string()))?;
-                // In real implementation, look up building by name
-                Ok(format!("name: \"{}\"", building_name))
+            ScopeType::CurrentTeam => {
+                // CurrentTeam scope is always a direct teamId filter
+                Ok(Some(serde_json::json!({ "teamId": ctx.team_id })))
             },
-            ScopeType::RealEstate => {
-                let real_estate_name = scope.real_estate_name.as_ref()
-                    .ok_or_else(|| ToolError::InvalidParameters("RealEstate scope requires real_estate_name".to_string()))?;
-                // In real implementation, look up real estate by name
-                Ok(format!("realEstateName: \"{}\"", real_estate_name))
+            ScopeType::Building | ScopeType::RealEstate => {
+                // Get already-resolved scope ID (resolution happened during normalization)
+                let resolved_id = Self::get_scope_id(scope)?
+                    .ok_or_else(|| ToolError::InvalidParameters("Expected resolved ID for non-CurrentTeam scope".to_string()))?;
+
+                // Look up relation in RelationMap
+                let relation = relation_map::get_relation_path(target, &scope.r#type)
+                    .ok_or_else(|| ToolError::InvalidParameters(
+                        format!("No relation defined for target {:?} with scope type {:?}", target, scope.r#type)
+                    ))?;
+
+                // Generate constraint using relation path
+                let constraint = relation_map::compile_scope_constraint(relation, &resolved_id);
+                Ok(Some(constraint))
             },
         }
     }
 
-    /// Compile filters into GraphQL where clause fragment
-    fn compile_filters(filters: &Filters) -> Option<String> {
-        let mut filter_parts = Vec::new();
+    /// Get scope ID from already-resolved scope (for non-CurrentTeam scopes)
+    /// INVARIANT: Scope IDs must be resolved during normalization, never here
+    fn get_scope_id(scope: &Scope) -> Result<Option<String>, ToolError> {
+        match &scope.r#type {
+            ScopeType::CurrentTeam => Ok(None), // CurrentTeam doesn't need ID resolution
+            ScopeType::Building => {
+                scope.building_id.as_ref()
+                    .ok_or_else(|| ToolError::InvalidParameters("Building scope requires resolved building_id".to_string()))
+                    .map(|id| Some(id.clone()))
+            },
+            ScopeType::RealEstate => {
+                scope.real_estate_id.as_ref()
+                    .ok_or_else(|| ToolError::InvalidParameters("RealEstate scope requires resolved real_estate_id".to_string()))
+                    .map(|id| Some(id.clone()))
+            },
+        }
+    }
+
+    /// Compile filters into GraphQL where clause JSON
+    fn compile_filters_to_json(filters: &Filters) -> Option<serde_json::Value> {
+        let mut filter_obj = serde_json::Map::new();
 
         // Handle status filter
         if let Some(ref status_str) = filters.status {
@@ -1343,24 +1445,31 @@ impl IntentQueryTool {
                 "not_completed" => "NOT_COMPLETED",
                 _ => return None, // Invalid status, skip filters
             };
-            filter_parts.push(format!("status: {}", status_value));
+            filter_obj.insert("status".to_string(), serde_json::json!(status_value));
         }
 
         // Handle year range filters
         if let Some(year_min) = filters.year_min {
-            filter_parts.push(format!("yearBuilt: {{ gte: {} }}", year_min));
+            filter_obj.insert("yearBuilt".to_string(), serde_json::json!({ "gte": year_min }));
         }
         if let Some(year_max) = filters.year_max {
-            filter_parts.push(format!("yearBuilt: {{ lte: {} }}", year_max));
+            // If yearBuilt already exists (from year_min), merge the constraints
+            if let Some(existing) = filter_obj.get_mut("yearBuilt") {
+                if let serde_json::Value::Object(ref mut obj) = existing {
+                    obj.insert("lte".to_string(), serde_json::json!(year_max));
+                }
+            } else {
+                filter_obj.insert("yearBuilt".to_string(), serde_json::json!({ "lte": year_max }));
+            }
         }
 
         // Handle other filters as needed
         // For now, only status and year filters are supported
 
-        if filter_parts.is_empty() {
+        if filter_obj.is_empty() {
             None
         } else {
-            Some(filter_parts.join(", "))
+            Some(serde_json::Value::Object(filter_obj))
         }
     }
 }
@@ -1396,11 +1505,8 @@ impl ToolPort for IntentQueryTool {
         // ─────────────────────────────────────────────
         Self::normalize_time_and_status_filters(&mut intent, &input.user_message);
 
-        // ─────────────────────────────────────────────
-        // 2.5. Building scope normalization
-        //     (fix LLM scope loss for explicit building references)
-        // ─────────────────────────────────────────────
-        self.normalize_explicit_building_scope(&mut intent, &input.user_message, &*ctx.name_registry);
+        // NOTE: Building scope normalization now happens BEFORE tool eligibility check in executor
+        // This ensures name resolution fails early on unknown buildings
 
         // ─────────────────────────────────────────────
         // 3. Filter validation (FilterCapabilityMatrix)
@@ -1425,7 +1531,7 @@ impl ToolPort for IntentQueryTool {
         // 5. Compile intent → GraphQL
         // ─────────────────────────────────────────────
         let graphql_query =
-            Self::compile_intent_to_graphql(&intent, &request_ctx)?;
+            Self::compile_intent_to_graphql(&intent, &request_ctx, &*self.registry)?;
 
         // ─────────────────────────────────────────────
         // 6. Execute (placeholder)
@@ -1469,7 +1575,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -1493,7 +1601,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -1517,7 +1627,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::Building,
+                building_id: None, // Test case - not resolved
                 building_name: Some("X".to_string()),
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: Some(Metric::TotalFloorArea),
@@ -1613,7 +1725,8 @@ mod tests {
             current_real_estate_id: None,
         };
 
-        let compile_result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx);
+        let registry = create_test_registry();
+        let compile_result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx, &*registry);
         assert!(compile_result.is_ok(), "Compilation should succeed: {:?}", compile_result.err());
         let query = compile_result.unwrap();
         assert!(query.contains("buildings"));
@@ -1632,7 +1745,7 @@ mod tests {
             action: Action::Count,
             target: Target::Component,
             attribute: None,
-            scope: Scope { r#type: ScopeType::CurrentTeam, building_name: None, real_estate_name: None },
+            scope: Scope { r#type: ScopeType::CurrentTeam, building_id: None, building_name: None, real_estate_id: None, real_estate_name: None },
             metric: None,
             filters: None,
             limit: None,
@@ -1645,7 +1758,7 @@ mod tests {
             action: Action::Count,
             target: Target::Building,
             attribute: Some("windows".to_string()),
-            scope: Scope { r#type: ScopeType::CurrentTeam, building_name: None, real_estate_name: None },
+            scope: Scope { r#type: ScopeType::CurrentTeam, building_id: None, building_name: None, real_estate_id: None, real_estate_name: None },
             metric: None,
             filters: None,
             limit: None,
@@ -1658,7 +1771,7 @@ mod tests {
             action: Action::Aggregate,
             target: Target::Building,
             attribute: Some("floorArea".to_string()),
-            scope: Scope { r#type: ScopeType::CurrentTeam, building_name: None, real_estate_name: None },
+            scope: Scope { r#type: ScopeType::CurrentTeam, building_id: None, building_name: None, real_estate_id: None, real_estate_name: None },
             metric: Some(Metric::Sum),
             filters: None,
             limit: None,
@@ -1676,7 +1789,7 @@ mod tests {
             action: Action::Aggregate,
             target: Target::Component,
             attribute: None,
-            scope: Scope { r#type: ScopeType::CurrentTeam, building_name: None, real_estate_name: None },
+            scope: Scope { r#type: ScopeType::CurrentTeam, building_id: None, building_name: None, real_estate_id: None, real_estate_name: None },
             metric: Some(Metric::Sum), // Components don't support aggregation
             filters: None,
             limit: None,
@@ -1689,7 +1802,7 @@ mod tests {
             action: Action::Count,
             target: Target::Project, // Test unsupported combination (not in registry)
             attribute: None,
-            scope: Scope { r#type: ScopeType::CurrentTeam, building_name: None, real_estate_name: None },
+            scope: Scope { r#type: ScopeType::CurrentTeam, building_id: None, building_name: None, real_estate_id: None, real_estate_name: None },
             metric: None,
             filters: None,
             limit: None,
@@ -1748,7 +1861,8 @@ mod tests {
             current_real_estate_id: None,
         };
 
-        let compile_result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx);
+        let registry = create_test_registry();
+        let compile_result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx, &*registry);
         assert!(compile_result.is_ok(), "Compilation should succeed: {:?}", compile_result.err());
         let query = compile_result.unwrap();
         assert!(query.contains("buildings"));
@@ -2012,7 +2126,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2040,7 +2156,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2068,7 +2186,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2095,7 +2215,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2121,7 +2243,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2156,7 +2280,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::Building,
+                building_id: Some("building-123".to_string()),
                 building_name: Some("Räven".to_string()),
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2188,7 +2314,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::Building,
+                building_id: Some("building-123".to_string()),
                 building_name: Some("Räven".to_string()),
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2220,7 +2348,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::Building,
+                building_id: Some("building-123".to_string()),
                 building_name: Some("Räven".to_string()),
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2252,7 +2382,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::Building,
+                building_id: Some("building-123".to_string()),
                 building_name: Some("Räven".to_string()),
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2284,7 +2416,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::Building,
+                building_id: Some("building-123".to_string()),
                 building_name: Some("Räven".to_string()),
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2318,7 +2452,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::Building,
-                building_name: Some("Test Building".to_string()),
+                building_id: Some("building-123".to_string()),
+                building_name: Some("Räven".to_string()),
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2334,11 +2470,14 @@ mod tests {
             current_real_estate_id: None,
         };
 
-        let result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx);
+        let registry = create_test_registry();
+        let result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx, &*registry);
         assert!(result.is_ok());
         let query = result.unwrap();
         assert!(query.contains("components"));
         assert!(query.contains("_count"));
+        assert!(query.contains("buildingId"));
+        assert!(query.contains("building-123"));
     }
 
     #[test]
@@ -2349,7 +2488,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2365,7 +2506,8 @@ mod tests {
             current_real_estate_id: None,
         };
 
-        let result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx);
+        let registry = create_test_registry();
+        let result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx, &*registry);
         assert!(result.is_ok());
         let query = result.unwrap();
         assert!(query.contains("buildings"));
@@ -2381,7 +2523,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: Some(Metric::TotalFloorArea),
@@ -2397,7 +2541,8 @@ mod tests {
             current_real_estate_id: None,
         };
 
-        let result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx);
+        let registry = create_test_registry();
+        let result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx, &*registry);
         assert!(result.is_ok());
 
         let query = result.unwrap();
@@ -2415,7 +2560,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2431,7 +2578,8 @@ mod tests {
             current_real_estate_id: None,
         };
 
-        let result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx);
+        let registry = create_test_registry();
+        let result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx, &*registry);
         assert!(result.is_ok());
 
         let query = result.unwrap();
@@ -2448,7 +2596,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2464,44 +2614,37 @@ mod tests {
             current_real_estate_id: None,
         };
 
-        let result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx);
+        let registry = create_test_registry();
+        let result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx, &*registry);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_resolve_scope_building_name() {
+    fn test_get_scope_id_building() {
         let scope = Scope {
             r#type: ScopeType::Building,
-            building_name: Some("Test Building".to_string()),
+            building_id: Some("building-123".to_string()),
+            building_name: Some("Räven".to_string()),
+            real_estate_id: None,
             real_estate_name: None,
         };
-        let ctx = RequestContext {
-            team_id: "team-123".to_string(),
-            user_id: "user-456".to_string(),
-            current_building_id: None,
-            current_real_estate_id: None,
-        };
 
-        let result = IntentQueryTool::resolve_scope(&scope, &ctx);
+        let result = IntentQueryTool::get_scope_id(&scope);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "name: \"Test Building\"");
+        assert_eq!(result.unwrap(), Some("building-123".to_string()));
     }
 
     #[test]
-    fn test_resolve_scope_building_missing_name() {
+    fn test_get_scope_id_building_missing_id() {
         let scope = Scope {
             r#type: ScopeType::Building,
-            building_name: None, // Missing required building_name
+            building_id: None, // Missing required building_id
+            building_name: None,
+            real_estate_id: None,
             real_estate_name: None,
         };
-        let ctx = RequestContext {
-            team_id: "team-123".to_string(),
-            user_id: "user-456".to_string(),
-            current_building_id: None,
-            current_real_estate_id: None,
-        };
 
-        let result = IntentQueryTool::resolve_scope(&scope, &ctx);
+        let result = IntentQueryTool::get_scope_id(&scope);
         assert!(result.is_err());
     }
 
@@ -2516,7 +2659,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2544,11 +2689,13 @@ mod tests {
                 action: Action::Count,
                 target: Target::Component,
                 attribute: None,
-                scope: Scope {
-                    r#type: ScopeType::Building,
-                    building_name: Some("Test Building".to_string()),
-                    real_estate_name: None,
-                },
+            scope: Scope {
+                r#type: ScopeType::Building,
+                building_id: None, // Test building - not in registry
+                building_name: Some("Test Building".to_string()),
+                real_estate_id: None,
+                real_estate_name: None,
+            },
                 metric: None,
                 filters: None,
                 limit: None,
@@ -2560,7 +2707,9 @@ mod tests {
                 attribute: None,
                 scope: Scope {
                     r#type: ScopeType::CurrentTeam,
+                    building_id: None,
                     building_name: None,
+                    real_estate_id: None,
                     real_estate_name: None,
                 },
                 metric: None,
@@ -2574,7 +2723,9 @@ mod tests {
                 attribute: None,
                 scope: Scope {
                     r#type: ScopeType::CurrentTeam,
+                    building_id: None,
                     building_name: None,
+                    real_estate_id: None,
                     real_estate_name: None,
                 },
                 metric: Some(Metric::TotalFloorArea),
@@ -2592,7 +2743,9 @@ mod tests {
                 attribute: None,
                 scope: Scope {
                     r#type: ScopeType::CurrentTeam,
+                    building_id: None,
                     building_name: None,
+                    real_estate_id: None,
                     real_estate_name: None,
                 },
                 metric: None,
@@ -2721,7 +2874,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::Building,
+                building_id: Some("building-123".to_string()),
                 building_name: Some("Räven".to_string()),
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2750,7 +2905,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2779,7 +2936,9 @@ mod tests {
             attribute: None,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2799,7 +2958,9 @@ mod tests {
             attribute: Some("".to_string()),
             scope: Scope {
                 r#type: ScopeType::Building,
+                building_id: Some("building-123".to_string()),
                 building_name: Some("Räven".to_string()),
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2826,7 +2987,9 @@ mod tests {
             attribute: Some("open".to_string()),
             scope: Scope {
                 r#type: ScopeType::Building,
+                building_id: Some("building-123".to_string()),
                 building_name: Some("Räven".to_string()),
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2856,7 +3019,9 @@ mod tests {
             attribute: Some("completed".to_string()),
             scope: Scope {
                 r#type: ScopeType::Building,
+                building_id: Some("building-123".to_string()),
                 building_name: Some("Räven".to_string()),
+                real_estate_id: None,
                 real_estate_name: None,
             },
             metric: None,
@@ -2982,7 +3147,9 @@ mod tests {
             target: Target::Measure,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             attribute: None,
@@ -3002,7 +3169,7 @@ mod tests {
 
         let user_message = "How many incomplete measures are in building Räven?";
 
-        IntentQueryTool::new(create_test_registry()).normalize_explicit_building_scope(&mut intent, user_message, &*create_test_registry());
+        IntentQueryTool::normalize_explicit_building_scope(&mut intent, user_message, &*create_test_registry());
 
         // Should have been corrected to building scope
         assert!(matches!(intent.scope.r#type, ScopeType::Building));
@@ -3016,7 +3183,9 @@ mod tests {
             target: Target::Measure,
             scope: Scope {
                 r#type: ScopeType::Building,
+                building_id: Some("building-123".to_string()),
                 building_name: Some("Räven".to_string()),
+                real_estate_id: None,
                 real_estate_name: None,
             },
             attribute: None,
@@ -3030,7 +3199,7 @@ mod tests {
 
         // Should not change existing building scope
         let original_scope = intent.scope.clone();
-        IntentQueryTool::new(create_test_registry()).normalize_explicit_building_scope(&mut intent, user_message, &*create_test_registry());
+        IntentQueryTool::normalize_explicit_building_scope(&mut intent, user_message, &*create_test_registry());
 
         assert_eq!(intent.scope.r#type, original_scope.r#type);
         assert_eq!(intent.scope.building_name, original_scope.building_name);
@@ -3044,7 +3213,9 @@ mod tests {
             target: Target::Measure,
             scope: Scope {
                 r#type: ScopeType::CurrentTeam,
+                building_id: None,
                 building_name: None,
+                real_estate_id: None,
                 real_estate_name: None,
             },
             attribute: None,
@@ -3054,22 +3225,22 @@ mod tests {
             group_by: None,
         };
 
-        IntentQueryTool::new(create_test_registry()).normalize_explicit_building_scope(&mut intent, "How many measures were completed in 2025?", &*create_test_registry());
+        IntentQueryTool::normalize_explicit_building_scope(&mut intent, "How many measures were completed in 2025?", &*create_test_registry());
         assert!(matches!(intent.scope.r#type, ScopeType::CurrentTeam));
 
         // Test case 2: "in progress" should not trigger building extraction
         let mut intent2 = intent.clone();
-        IntentQueryTool::new(create_test_registry()).normalize_explicit_building_scope(&mut intent2, "List measures in progress", &*create_test_registry());
+        IntentQueryTool::normalize_explicit_building_scope(&mut intent2, "List measures in progress", &*create_test_registry());
         assert!(matches!(intent2.scope.r#type, ScopeType::CurrentTeam));
 
         // Test case 3: lowercase building names should not be accepted
         let mut intent3 = intent.clone();
-        IntentQueryTool::new(create_test_registry()).normalize_explicit_building_scope(&mut intent3, "How many measures are in building räven?", &*create_test_registry());
+        IntentQueryTool::normalize_explicit_building_scope(&mut intent3, "How many measures are in building räven?", &*create_test_registry());
         assert!(matches!(intent3.scope.r#type, ScopeType::CurrentTeam));
 
         // Test case 4: "the building" should not trigger extraction
         let mut intent4 = intent.clone();
-        IntentQueryTool::new(create_test_registry()).normalize_explicit_building_scope(&mut intent4, "How many measures are in the building?", &*create_test_registry());
+        IntentQueryTool::normalize_explicit_building_scope(&mut intent4, "How many measures are in the building?", &*create_test_registry());
         assert!(matches!(intent4.scope.r#type, ScopeType::CurrentTeam));
     }
 
@@ -3086,6 +3257,124 @@ mod tests {
             IntentQueryTool::extract_building_name_from_message("in Building Complex A which has"),
             Some("Building Complex A".to_string())
         );
+    }
+
+    #[test]
+    fn test_building_scope_normalization_measures_in_raeven() {
+        let mut intent = Intent {
+            action: Action::Count,
+            target: Target::Measure,
+            attribute: None,
+            scope: Scope {
+                r#type: ScopeType::CurrentTeam,
+                building_id: None,
+                building_name: None,
+                real_estate_id: None,
+                real_estate_name: None,
+            },
+            metric: None,
+            filters: None,
+            limit: None,
+            group_by: None,
+        };
+
+        let user_message = "How many measures are in building Räven?";
+        let registry = create_test_registry();
+
+        let result = IntentQueryTool::normalize_explicit_building_scope(&mut intent, user_message, &*registry);
+        assert!(result.is_ok(), "Normalization should succeed: {:?}", result.err());
+
+        // Assert scope.type == building
+        assert!(matches!(intent.scope.r#type, ScopeType::Building));
+
+        // Assert building_name == "Räven"
+        assert_eq!(intent.scope.building_name, Some("Räven".to_string()));
+        assert_eq!(intent.scope.building_id, Some("building-123".to_string()));
+    }
+
+    #[test]
+    fn test_building_scope_normalization_incomplete_measures_in_raeven() {
+        let mut intent = Intent {
+            action: Action::Count,
+            target: Target::Measure,
+            attribute: None,
+            scope: Scope {
+                r#type: ScopeType::CurrentTeam,
+                building_id: None,
+                building_name: None,
+                real_estate_id: None,
+                real_estate_name: None,
+            },
+            metric: None,
+            filters: Some(Filters {
+                component_type: None,
+                building_type: None,
+                year_min: None,
+                year_max: None,
+                completed: Some(false),
+                verified: None,
+                status: None,
+            }),
+            limit: None,
+            group_by: None,
+        };
+
+        let user_message = "How many incomplete measures are in building Räven?";
+        let registry = create_test_registry();
+
+        let result = IntentQueryTool::normalize_explicit_building_scope(&mut intent, user_message, &*registry);
+        assert!(result.is_ok(), "Normalization should succeed: {:?}", result.err());
+
+        // Assert scope.type == building
+        assert!(matches!(intent.scope.r#type, ScopeType::Building));
+
+        // Assert building_name == "Räven"
+        assert_eq!(intent.scope.building_name, Some("Räven".to_string()));
+        assert_eq!(intent.scope.building_id, Some("building-123".to_string()));
+
+        // Test GraphQL compilation
+        let ctx = RequestContext {
+            team_id: "team-123".to_string(),
+            user_id: "user-456".to_string(),
+            current_building_id: None,
+            current_real_estate_id: None,
+        };
+
+        let compile_result = IntentQueryTool::compile_intent_to_graphql(&intent, &ctx, &*registry);
+        assert!(compile_result.is_ok(), "Compilation should succeed: {:?}", compile_result.err());
+
+        let query = compile_result.unwrap();
+        // Assert GraphQL contains building constraint (buildingId), not teamId
+        assert!(query.contains("buildingId"));
+        assert!(query.contains("building-123"));
+        assert!(!query.contains("teamId")); // Building-scoped queries should NOT have teamId
+    }
+
+    #[test]
+    fn test_building_scope_normalization_unknown_building_fails() {
+        let mut intent = Intent {
+            action: Action::Count,
+            target: Target::Measure,
+            attribute: None,
+            scope: Scope {
+                r#type: ScopeType::CurrentTeam,
+                building_id: None,
+                building_name: None,
+                real_estate_id: None,
+                real_estate_name: None,
+            },
+            metric: None,
+            filters: None,
+            limit: None,
+            group_by: None,
+        };
+
+        let user_message = "How many measures are in building UnknownBuilding?";
+        let registry = create_test_registry();
+
+        let result = IntentQueryTool::normalize_explicit_building_scope(&mut intent, user_message, &*registry);
+        assert!(result.is_err(), "Normalization should fail for unknown building");
+        assert!(result.unwrap_err().to_string().contains("Building 'UnknownBuilding' not found"));
     }
 }
 
