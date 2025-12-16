@@ -36,7 +36,7 @@ impl IntentSchema {
 }
 
 // Compile-time embedded schema
-static SCHEMA_JSON: &str = include_str!("../../schemas/intent.schema.json");
+static SCHEMA_JSON: &str = include_str!("../../../schemas/intent.schema.json");
 
 // Global singleton IntentSchema instance
 static INTENT_SCHEMA: Lazy<IntentSchema> = Lazy::new(|| {

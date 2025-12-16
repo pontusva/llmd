@@ -1,4 +1,4 @@
-use crate::toolport::{ToolPort, ToolInput, ToolOutput, ToolError, ToolEligibility, ToolEligibilityContext};
+use crate::runtime::toolport::{ToolPort, ToolInput, ToolOutput, ToolError, ToolEligibility, ToolEligibilityContext};
 
 /// EchoTool simply returns the input payload unchanged.
 ///
@@ -20,7 +20,7 @@ impl ToolPort for EchoTool {
         "echo"
     }
 
-    fn execute(&self, input: ToolInput, _ctx: &crate::executor::ExecutorContext) -> Result<ToolOutput, ToolError> {
+    fn execute(&self, input: ToolInput, _ctx: &crate::runtime::executor::ExecutorContext) -> Result<ToolOutput, ToolError> {
         // EchoTool expects a string payload (validated by executor)
         // Return the input payload unchanged
         Ok(ToolOutput {

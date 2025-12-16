@@ -1,11 +1,11 @@
 use std::sync::Arc;
-use crate::embedding_observability::EmbeddingStats;
+use crate::memory::embedding_observability::EmbeddingStats;
 use crate::llm::{LlmModelTrait, GenerateOptions, ChatMessage};
-use crate::persona_memory::{IntelligentMemory, MemoryConfig, MemoryType, MemoryMode, MemoryPolicy};
-use crate::system_prompt::SystemPromptManager;
-use crate::model::Model;
-use crate::toolport::{ToolRegistry, parse_tool_call, ToolEligibilityContext};
-use crate::embedding_decision::{EmbeddingDecisionMatrix, MemoryEventKind, DecisionContext, DecisionResult};
+use crate::memory::persona_memory::{IntelligentMemory, MemoryConfig, MemoryType, MemoryMode, MemoryPolicy};
+use crate::llm::system_prompt::SystemPromptManager;
+use crate::core::model::Model;
+use crate::runtime::toolport::{ToolRegistry, parse_tool_call, ToolEligibilityContext};
+use crate::memory::embedding_decision::{EmbeddingDecisionMatrix, MemoryEventKind, DecisionContext, DecisionResult};
 use crate::tools::graphql::NameResolutionRegistry;
 use futures::Stream;
 use serde_json;
@@ -346,9 +346,9 @@ impl Executor {
                 }
 
                 // Tool is eligible and arguments are valid, execute it
-                let tool_input = crate::toolport::ToolInput {
+                let tool_input = crate::runtime::toolport::ToolInput {
                     payload: tool_call.arguments.args,
-                    metadata: crate::toolport::ToolMetadata {
+                    metadata: crate::runtime::toolport::ToolMetadata {
                         tool_name: tool_call.name.clone(),
                     },
                     user_message: last_user_msg.clone(),

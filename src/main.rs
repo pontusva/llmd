@@ -2,31 +2,19 @@ use axum;
 use tracing_subscriber;
 use std::sync::Arc;
 use model_loader_core::plan::LoadPlan;
-use crate::toolport::ToolRegistry;
-use crate::tools::echo::EchoTool;
-use crate::tools::graphql::IntentQueryTool;
+use llmd::runtime::toolport::ToolRegistry;
+use llmd::tools::echo::EchoTool;
 
-mod model;
-mod routes;
-mod state;
-mod errors;
-mod vector_store;
-mod storage;
-mod llm;
-mod llm_factory;
-mod prompt_format;
-mod system_prompt;
-mod persona_memory;
-mod llm_registry;
-mod executor;
-mod embedding_decision;
-mod embedding_observability;
-mod toolport;
-pub mod schema;
-mod tools {
-    pub mod echo;
-    pub mod graphql;
-}
+
+
+
+
+
+
+
+
+
+
 
 use std::io::{self, Read};
 
@@ -87,11 +75,11 @@ async fn main() {
 
     // Initialize name resolution registry with empty lists for now
     // TODO: Load actual building/real estate names from configuration or database
-    let name_registry = crate::tools::graphql::InMemoryNameRegistry::new(
+    let name_registry = llmd::tools::graphql::InMemoryNameRegistry::new(
         vec![], // buildings
         vec![], // real_estates
     );
-    tool_registry.register(crate::tools::graphql::IntentQueryTool::new(
+    tool_registry.register(llmd::tools::graphql::IntentQueryTool::new(
         Box::new(name_registry)
     ));
     let tool_registry = Arc::new(tool_registry);
@@ -118,20 +106,20 @@ async fn main() {
                 println!("  {:?}", step);
             }
 
-            state::AppState::init_from_plan(load_plan, tool_registry)
+            llmd::runtime::state::AppState::init_from_plan(load_plan, tool_registry)
                 .await
                 .expect("failed to initialize AppState from LoadPlan")
         }
         LlmBackend::Ollama => {
             // No LoadPlan needed for Ollama
             println!("🔗 Initializing Ollama backend (no LoadPlan required)");
-            state::AppState::init_remote_llm(tool_registry)
+            llmd::runtime::state::AppState::init_remote_llm(tool_registry)
                 .await
                 .expect("failed to initialize AppState for Ollama")
         }
     };
 
-    let app = routes::routes().with_state(state);
+    let app = llmd::runtime::routes::routes().with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await

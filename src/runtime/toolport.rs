@@ -81,7 +81,7 @@ pub trait ToolPort: ToolEligibility {
     ///
     /// # Returns
     /// ToolOutput on success, ToolError on failure
-    fn execute(&self, input: ToolInput, ctx: &crate::executor::ExecutorContext) -> Result<ToolOutput, ToolError>;
+    fn execute(&self, input: ToolInput, ctx: &crate::runtime::executor::ExecutorContext) -> Result<ToolOutput, ToolError>;
 }
 
 /// ToolRegistry maps tool names to ToolPort implementations

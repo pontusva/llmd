@@ -4,7 +4,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use tokenizers::Tokenizer;
 use std::fs;
-use crate::persona_memory::EmbeddingModel;
+use crate::memory::persona_memory::EmbeddingModel;
 
 pub struct Model {
     model: Option<BertModel>,

@@ -1,8 +1,10 @@
-use crate::toolport::{ToolPort, ToolInput, ToolOutput, ToolError, ToolEligibility, ToolEligibilityContext};
+use crate::runtime::toolport::{ToolPort, ToolInput, ToolOutput, ToolError, ToolEligibility, ToolEligibilityContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use schemars::JsonSchema;
-use crate::schema;
+use crate::core::schema;
+
+
 
 /// Intent Schema - Authoritative model for data access requests
 /// LLMs output Intent JSON, backend compiles to GraphQL
@@ -1050,40 +1052,47 @@ impl IntentQueryTool {
 
     /// Extract building name from user message using conservative patterns
     fn extract_building_name_from_message(message: &str) -> Option<String> {
-        let msg = message.to_lowercase();
-
-        // Check for "building X" pattern - requires X to start with uppercase
-        if let Some(idx) = msg.find("building ") {
-            let after_building = &message[idx + 9..]; // Use original case
+        let lower = message.to_lowercase();
+    
+        // ─────────────────────────────────────────────
+        // Pattern 1: "building X"
+        // ─────────────────────────────────────────────
+        if let Some(idx) = lower.find("building ") {
+            let after_building = &message[idx + "building ".len()..];
+    
             if let Some(name) = Self::extract_building_name_from_words(after_building) {
-                // Must start with uppercase letter (building names are proper nouns)
                 if name.chars().next().unwrap_or(' ').is_uppercase() {
                     return Some(name);
                 }
             }
         }
-
-        // Check for "in X" pattern - only if X starts with uppercase
-        if let Some(idx) = msg.find(" in ") {
-            let after_in = &message[idx + 4..]; // Use original case
+    
+        // ─────────────────────────────────────────────
+        // Pattern 2: "in X"
+        // ─────────────────────────────────────────────
+        if let Some(idx) = lower.find(" in ") {
+            let after_in = &message[idx + 4..]; // keep original casing
             let mut words = after_in.split_whitespace();
-
+    
             if let Some(first_word) = words.next() {
-                // Must start with uppercase letter (building names are proper nouns)
-                if first_word.chars().next()?.is_uppercase() {
-                    // Reject temporal and numeric patterns
+                if first_word.chars().next().unwrap_or(' ').is_uppercase() {
                     let first_lower = first_word.to_lowercase();
+    
                     if !Self::is_rejected_building_candidate(&first_lower) {
-                        let remaining: Vec<&str> = words.take(2).collect(); // Max 3 words total
-                        let candidate_words = std::iter::once(first_word).chain(remaining.iter().cloned());
-                        if let Some(name) = Self::extract_building_name_from_words(&candidate_words.collect::<Vec<_>>().join(" ")) {
+                        let remaining: Vec<&str> = words.take(2).collect();
+                        let candidate = std::iter::once(first_word)
+                            .chain(remaining.iter().copied())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+    
+                        if let Some(name) = Self::extract_building_name_from_words(&candidate) {
                             return Some(name);
                         }
                     }
                 }
             }
         }
-
+    
         None
     }
 
@@ -1366,7 +1375,7 @@ impl ToolPort for IntentQueryTool {
         true
     }
 
-    fn execute(&self, input: ToolInput, ctx: &crate::executor::ExecutorContext) -> Result<ToolOutput, ToolError> {
+    fn execute(&self, input: ToolInput, ctx: &crate::runtime::executor::ExecutorContext) -> Result<ToolOutput, ToolError> {
         // ─────────────────────────────────────────────
         // 0. JSON SCHEMA VALIDATION (HARD CONTRACT)
         // ─────────────────────────────────────────────

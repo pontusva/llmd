@@ -7,9 +7,9 @@ use axum::{
     response::{IntoResponse, Response, sse::{Sse, Event}},
 };
 use serde::{Deserialize, Serialize};
-use crate::state::AppState;
-use crate::persona_memory::{IntelligentMemory, MemoryType, MemoryConfig, MemoryMode, MemoryPolicy, EmbeddingModel};
-use crate::executor::MemoryUpdateTask;
+use crate::runtime::state::AppState;
+use crate::memory::persona_memory::{IntelligentMemory, MemoryType, MemoryConfig, MemoryMode, MemoryPolicy, EmbeddingModel};
+use crate::runtime::executor::MemoryUpdateTask;
 use uuid::Uuid;
 use futures::StreamExt;
 use serde_json::json;

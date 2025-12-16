@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use hnsw_rs::prelude::*;
-use crate::storage::Storage;
+use crate::memory::storage::Storage;
 use anyhow::Result;
 
 #[derive(Clone, Serialize)]

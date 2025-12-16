@@ -1,15 +1,15 @@
-use crate::embedding_observability::EmbeddingStats;
-use crate::executor::Executor;
+use crate::memory::embedding_observability::EmbeddingStats;
+use crate::runtime::executor::Executor;
 use crate::llm::LlmModelTrait;
-use crate::llm_factory::build_llm_from_env;
-use crate::llm_registry::LlmRegistry;
-use crate::model::Model;
-use crate::persona_memory::IntelligentMemory;
-use crate::storage::Storage;
-use crate::system_prompt::SystemPromptManager;
-use crate::toolport::ToolRegistry;
+use crate::llm::llm_factory::build_llm_from_env;
+use crate::llm::llm_registry::LlmRegistry;
+use crate::core::model::Model;
+use crate::memory::persona_memory::IntelligentMemory;
+use crate::memory::storage::Storage;
+use crate::llm::system_prompt::SystemPromptManager;
+use crate::runtime::toolport::ToolRegistry;
 use crate::tools::graphql::NameResolutionRegistry;
-use crate::vector_store::VectorStore;
+use crate::memory::vector_store::VectorStore;
 
 use model_loader_core::plan::{LoadPlan, LoadStep};
 

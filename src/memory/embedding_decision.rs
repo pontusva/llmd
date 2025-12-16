@@ -1,5 +1,5 @@
-use crate::embedding_observability::EmbeddingStats;
-use crate::persona_memory::{MemoryConfig, MemoryMode, MemoryType};
+use crate::memory::embedding_observability::EmbeddingStats;
+use crate::memory::persona_memory::{MemoryConfig, MemoryMode, MemoryType};
 use std::sync::Arc;
 
 /// Events that trigger embedding/memory decisions in the Executor
@@ -394,7 +394,7 @@ impl EmbeddingDecisionMatrix {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persona_memory::{MemoryMode, MemoryPolicy};
+    use crate::memory::persona_memory::{MemoryMode, MemoryPolicy};
 
     fn create_test_config() -> MemoryConfig {
         MemoryConfig {
