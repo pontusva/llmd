@@ -1109,9 +1109,7 @@ impl IntentQueryTool {
             let after_building = &message[idx + "building ".len()..];
     
             if let Some(name) = Self::extract_building_name_from_words(after_building) {
-                if name.chars().next().unwrap_or(' ').is_uppercase() {
-                    return Some(name);
-                }
+                return Some(name);
             }
         }
     
@@ -1123,19 +1121,17 @@ impl IntentQueryTool {
             let mut words = after_in.split_whitespace();
     
             if let Some(first_word) = words.next() {
-                if first_word.chars().next().unwrap_or(' ').is_uppercase() {
-                    let first_lower = first_word.to_lowercase();
-    
-                    if !Self::is_rejected_building_candidate(&first_lower) {
-                        let remaining: Vec<&str> = words.take(2).collect();
-                        let candidate = std::iter::once(first_word)
-                            .chain(remaining.iter().copied())
-                            .collect::<Vec<_>>()
-                            .join(" ");
-    
-                        if let Some(name) = Self::extract_building_name_from_words(&candidate) {
-                            return Some(name);
-                        }
+                let first_lower = first_word.to_lowercase();
+
+                if !Self::is_rejected_building_candidate(&first_lower) {
+                    let remaining: Vec<&str> = words.take(2).collect();
+                    let candidate = std::iter::once(first_word)
+                        .chain(remaining.iter().copied())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+
+                    if let Some(name) = Self::extract_building_name_from_words(&candidate) {
+                        return Some(name);
                     }
                 }
             }
@@ -1217,6 +1213,87 @@ impl IntentQueryTool {
         }
     }
 
+    /// Validate intent JSON shape BEFORE parsing
+    /// Rejects structured attributes and unknown top-level fields
+    pub fn validate_intent_shape(intent_json: &serde_json::Value) -> Result<(), ToolError> {
+        let obj = intent_json.as_object()
+            .ok_or_else(|| ToolError::InvalidParameters(
+                "Intent must be a JSON object".to_string()
+            ))?;
+
+        // Check for forbidden "attributes" (plural) field
+        if obj.contains_key("attributes") {
+            return Err(ToolError::InvalidParameters(
+                "Invalid intent: 'attributes' (plural) field is forbidden. Use 'attribute' (singular) as a string.".to_string()
+            ));
+        }
+
+        // Validate "attribute" field if present
+        if let Some(attr_value) = obj.get("attribute") {
+            // Must be either null (for Option<String>) or a string
+            if !attr_value.is_null() && !attr_value.is_string() {
+                return Err(ToolError::InvalidParameters(
+                    "Invalid intent: 'attribute' must be a string or null, not an object or array.".to_string()
+                ));
+            }
+        }
+
+        // Check for unknown top-level fields (allow only known intent fields)
+        let allowed_fields = [
+            "action", "target", "entity", "scope", "attribute", "metric",
+            "filters", "limit", "group_by"
+        ];
+
+        for key in obj.keys() {
+            if !allowed_fields.contains(&key.as_str()) {
+                return Err(ToolError::InvalidParameters(
+                    format!("Invalid intent: unknown field '{}'. Valid fields are: {}", key, allowed_fields.join(", "))
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate dependent object rules
+    /// Certain attributes require specific targets and formatting
+    pub fn validate_dependent_objects(intent: &Intent) -> Result<(), ToolError> {
+        if let Some(ref attr) = intent.attribute {
+            let attr_lower = attr.to_lowercase();
+
+            // List of dependent physical objects that require building target
+            let dependent_objects = [
+                "windows", "doors", "rooms", "floors", "pipes", "sensors",
+                "panels", "vents", "stairs", "elevators"
+            ];
+
+            if dependent_objects.contains(&attr_lower.as_str()) {
+                // Must target building
+                if intent.target != Target::Building {
+                    return Err(ToolError::InvalidParameters(
+                        format!("Attribute '{}' requires target 'building', got '{:?}'", attr, intent.target)
+                    ));
+                }
+
+                // Must be lowercase plural string
+                if attr != &attr_lower || !attr.ends_with('s') {
+                    return Err(ToolError::InvalidParameters(
+                        format!("Attribute '{}' must be lowercase plural (e.g., 'windows'), got '{}'", attr_lower, attr)
+                    ));
+                }
+
+                // Cannot target component when using dependent objects
+                if intent.target == Target::Component {
+                    return Err(ToolError::InvalidParameters(
+                        format!("Attribute '{}' cannot be used with target 'component'", attr)
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Validate intent grammar structure (NOT capabilities)
     /// This only validates the grammar - capabilities are checked separately
     fn validate_grammar(intent: &Intent) -> Result<(), ToolError> {
@@ -1289,8 +1366,26 @@ impl IntentQueryTool {
         ctx: &RequestContext,
         registry: &dyn NameResolutionRegistry
     ) -> Result<String, ToolError> {
+        // GRAPHQL SAFETY ASSERTION: Building scope MUST have building constraint
+        if matches!(intent.scope.r#type, ScopeType::Building) {
+            // Verify we can resolve a building relation for this target
+            let has_building_relation = relation_map::get_relation_path(&intent.target, &ScopeType::Building).is_some();
+            if !has_building_relation {
+                return Err(ToolError::InvalidParameters(
+                    format!("Building scope requires building relation for target {:?}, but none exists", intent.target)
+                ));
+            }
+        }
+
         // Resolve scope using RelationMap
         let scope_constraint = Self::compile_scope_constraint(&intent.target, &intent.scope, ctx, registry)?;
+
+        // Additional safety check: if scope is Building, there MUST be a scope constraint
+        if matches!(intent.scope.r#type, ScopeType::Building) && scope_constraint.is_none() {
+            return Err(ToolError::InvalidParameters(
+                "Building scope compilation failed: no building constraint generated".to_string()
+            ));
+        }
 
         // Compile filters if present
         let filters_constraint = intent.filters.as_ref()
@@ -1497,7 +1592,33 @@ impl ToolPort for IntentQueryTool {
         // ─────────────────────────────────────────────
         // 1. Grammar parsing (structure only)
         // ─────────────────────────────────────────────
-        let mut intent = Self::parse_intent(&input.payload)?;
+        let mut intent = if let Some(parsed_intent) = input.parsed_intent {
+            // Use the pre-parsed and normalized intent from executor
+            parsed_intent
+        } else {
+            // Fallback: parse from payload (should not happen for normalized flow)
+            // EXECUTOR GUARDRAIL: Extract and validate intent shape BEFORE parsing
+            let payload_obj = input.payload.as_object()
+                .ok_or_else(|| ToolError::InvalidParameters("Tool payload must be a JSON object".to_string()))?;
+
+            let intent_value = payload_obj.get("intent")
+                .ok_or_else(|| ToolError::InvalidParameters("Missing required 'intent' field in tool payload".to_string()))?;
+
+            Self::validate_intent_shape(intent_value)?;
+            Self::parse_intent(&input.payload)?
+        };
+
+        // DEPENDENT OBJECT RULE ENFORCEMENT (run even for pre-parsed intents as extra safety)
+        Self::validate_dependent_objects(&intent)?;
+
+        // SCOPE NORMALIZATION GUARANTEE: If building mentioned but scope still current_team, reject
+        if input.user_message.to_lowercase().contains("building")
+            && matches!(intent.scope.r#type, crate::tools::graphql::ScopeType::CurrentTeam)
+        {
+            return Err(ToolError::InvalidParameters(
+                "Building mentioned but scope not resolved".to_string()
+            ));
+        }
 
         // ─────────────────────────────────────────────
         // 2. Natural-language normalization
@@ -3233,10 +3354,10 @@ mod tests {
         IntentQueryTool::normalize_explicit_building_scope(&mut intent2, "List measures in progress", &*create_test_registry());
         assert!(matches!(intent2.scope.r#type, ScopeType::CurrentTeam));
 
-        // Test case 3: lowercase building names should not be accepted
+        // Test case 3: lowercase building names should now be accepted
         let mut intent3 = intent.clone();
-        IntentQueryTool::normalize_explicit_building_scope(&mut intent3, "How many measures are in building räven?", &*create_test_registry());
-        assert!(matches!(intent3.scope.r#type, ScopeType::CurrentTeam));
+        let _ = IntentQueryTool::normalize_explicit_building_scope(&mut intent3, "How many measures are in building räven?", &*create_test_registry());
+        assert!(matches!(intent3.scope.r#type, ScopeType::Building));
 
         // Test case 4: "the building" should not trigger extraction
         let mut intent4 = intent.clone();
@@ -3255,7 +3376,7 @@ mod tests {
         // Test that extraction includes multiple words up to stop word
         assert_eq!(
             IntentQueryTool::extract_building_name_from_message("in Building Complex A which has"),
-            Some("Building Complex A".to_string())
+            Some("Complex A".to_string())
         );
     }
 
@@ -3375,6 +3496,196 @@ mod tests {
         let result = IntentQueryTool::normalize_explicit_building_scope(&mut intent, user_message, &*registry);
         assert!(result.is_err(), "Normalization should fail for unknown building");
         assert!(result.unwrap_err().to_string().contains("Building 'UnknownBuilding' not found"));
+    }
+
+    #[test]
+    fn test_validate_intent_shape_targets_inner_intent_object() {
+        // Test that validation correctly targets the inner intent object, not the outer payload
+        // This simulates the actual tool call structure: { "intent": { ... } }
+
+        // Valid tool call structure with valid intent
+        let valid_payload = serde_json::json!({
+            "intent": {
+                "action": "count",
+                "target": "building",
+                "attribute": "windows",
+                "scope": { "type": "building", "building_name": "Test" }
+            }
+        });
+
+        // Extract intent and validate
+        let intent_value = valid_payload.as_object().unwrap().get("intent").unwrap();
+        assert!(IntentQueryTool::validate_intent_shape(intent_value).is_ok());
+
+        // Invalid: "attributes" (plural) in the intent
+        let invalid_payload = serde_json::json!({
+            "intent": {
+                "action": "count",
+                "target": "building",
+                "attributes": ["window"],  // Wrong: should be "attribute"
+                "scope": { "type": "building", "building_name": "Test" }
+            }
+        });
+
+        let intent_value = invalid_payload.as_object().unwrap().get("intent").unwrap();
+        let result = IntentQueryTool::validate_intent_shape(intent_value);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("'attributes' (plural) field is forbidden"));
+
+        // Invalid: unknown field in the intent
+        let invalid_payload2 = serde_json::json!({
+            "intent": {
+                "action": "count",
+                "target": "building",
+                "unknown_field": "value",
+                "scope": { "type": "building", "building_name": "Test" }
+            }
+        });
+
+        let intent_value2 = invalid_payload2.as_object().unwrap().get("intent").unwrap();
+        let result2 = IntentQueryTool::validate_intent_shape(intent_value2);
+        assert!(result2.is_err());
+        assert!(result2.unwrap_err().to_string().contains("unknown field 'unknown_field'"));
+    }
+
+    #[test]
+    fn test_validate_intent_shape_rejects_structured_attributes() {
+        // Test rejection of "attributes" (plural) field
+        let invalid_json = serde_json::json!({
+            "action": "count",
+            "target": "building",
+            "attributes": { "type": "component", "value": "window" }
+        });
+        assert!(IntentQueryTool::validate_intent_shape(&invalid_json).is_err());
+
+        // Test rejection of structured attribute field
+        let invalid_json2 = serde_json::json!({
+            "action": "count",
+            "target": "building",
+            "attribute": { "type": "component", "value": "window" }
+        });
+        assert!(IntentQueryTool::validate_intent_shape(&invalid_json2).is_err());
+
+        // Test rejection of unknown fields
+        let invalid_json3 = serde_json::json!({
+            "action": "count",
+            "target": "building",
+            "unknown_field": "value"
+        });
+        assert!(IntentQueryTool::validate_intent_shape(&invalid_json3).is_err());
+
+        // Test acceptance of valid intent
+        let valid_json = serde_json::json!({
+            "action": "count",
+            "target": "building",
+            "attribute": "windows"
+        });
+        assert!(IntentQueryTool::validate_intent_shape(&valid_json).is_ok());
+    }
+
+    #[test]
+    fn test_validate_dependent_objects() {
+        // Test that windows requires building target
+        let intent = Intent {
+            action: Action::Count,
+            target: Target::Component, // Wrong target
+            scope: Scope {
+                r#type: ScopeType::CurrentTeam,
+                building_id: None,
+                building_name: None,
+                real_estate_id: None,
+                real_estate_name: None,
+            },
+            attribute: Some("windows".to_string()),
+            metric: None,
+            filters: None,
+            limit: None,
+            group_by: None,
+        };
+        assert!(IntentQueryTool::validate_dependent_objects(&intent).is_err());
+
+        // Test that windows with building target is OK
+        let intent_valid = Intent {
+            action: Action::Count,
+            target: Target::Building, // Correct target
+            scope: Scope {
+                r#type: ScopeType::CurrentTeam,
+                building_id: None,
+                building_name: None,
+                real_estate_id: None,
+                real_estate_name: None,
+            },
+            attribute: Some("windows".to_string()),
+            metric: None,
+            filters: None,
+            limit: None,
+            group_by: None,
+        };
+        assert!(IntentQueryTool::validate_dependent_objects(&intent_valid).is_ok());
+
+        // Test that non-dependent attributes are not validated
+        let intent_non_dependent = Intent {
+            action: Action::Count,
+            target: Target::Component,
+            scope: Scope {
+                r#type: ScopeType::CurrentTeam,
+                building_id: None,
+                building_name: None,
+                real_estate_id: None,
+                real_estate_name: None,
+            },
+            attribute: Some("some_other_attr".to_string()),
+            metric: None,
+            filters: None,
+            limit: None,
+            group_by: None,
+        };
+        assert!(IntentQueryTool::validate_dependent_objects(&intent_non_dependent).is_ok());
+    }
+
+    #[test]
+    fn test_registry_case_insensitive_resolution() {
+        let registry = create_test_registry();
+
+        // Test resolving canonical case
+        let result = registry.resolve_building("Räven");
+        assert!(result.is_some(), "Should resolve 'Räven'");
+        let resolved = result.unwrap();
+        assert_eq!(resolved.id, "building-123");
+        assert_eq!(resolved.name, "Räven");
+
+        // Test resolving lowercase
+        let result = registry.resolve_building("räven");
+        assert!(result.is_some(), "Should resolve 'räven' case-insensitively");
+        let resolved = result.unwrap();
+        assert_eq!(resolved.id, "building-123");
+        assert_eq!(resolved.name, "Räven"); // Should return canonical name
+
+        // Test resolving uppercase
+        let result = registry.resolve_building("RÄVEN");
+        assert!(result.is_some(), "Should resolve 'RÄVEN' case-insensitively");
+        let resolved = result.unwrap();
+        assert_eq!(resolved.id, "building-123");
+        assert_eq!(resolved.name, "Räven"); // Should return canonical name
+
+        // Test unknown building
+        let result = registry.resolve_building("UnknownBuilding");
+        assert!(result.is_none(), "Should return None for unknown building");
+    }
+
+    #[test]
+    fn test_extractor_extracts_lowercase_names() {
+        // Test that extractor now extracts lowercase building names
+        assert_eq!(
+            IntentQueryTool::extract_building_name_from_message("building räven that has measures"),
+            Some("räven".to_string())
+        );
+
+        // Test that extractor still extracts uppercase names
+        assert_eq!(
+            IntentQueryTool::extract_building_name_from_message("building Räven that has measures"),
+            Some("Räven".to_string())
+        );
     }
 }
 

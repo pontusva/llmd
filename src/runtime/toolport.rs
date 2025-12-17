@@ -37,6 +37,8 @@ pub struct ToolInput {
     /// Tool execution metadata
     pub metadata: ToolMetadata,
     pub user_message: String,
+    /// Pre-parsed and normalized intent (for query_intent tool)
+    pub parsed_intent: Option<crate::tools::graphql::Intent>,
 }
 
 /// Output from tool execution

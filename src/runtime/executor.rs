@@ -287,6 +287,56 @@ impl Executor {
                 // Parse the intent from tool arguments
                 match crate::tools::graphql::IntentQueryTool::parse_intent(&tool_call.arguments.args) {
                     Ok(mut intent) => {
+                        // EXECUTOR GUARDRAIL: Validate intent shape BEFORE any processing
+                        // Extract the intent value from the payload and validate it
+                        let payload_obj = match tool_call.arguments.args.as_object() {
+                            Some(obj) => obj,
+                            None => {
+                                tracing::warn!("Invalid tool arguments for '{}' - not a JSON object", tool_call.name);
+                                return Ok(serde_json::json!({
+                                    "error": "Invalid tool arguments",
+                                    "details": "Tool arguments must be a JSON object",
+                                    "tool": tool_call.name
+                                }).to_string());
+                            }
+                        };
+
+                        let intent_value = match payload_obj.get("intent") {
+                            Some(intent) => intent,
+                            None => {
+                                tracing::warn!("Missing 'intent' field in tool arguments for '{}'", tool_call.name);
+                                return Ok(serde_json::json!({
+                                    "error": "Invalid tool arguments",
+                                    "details": "Missing required 'intent' field in tool arguments",
+                                    "tool": tool_call.name
+                                }).to_string());
+                            }
+                        };
+
+                        if let Err(e) = crate::tools::graphql::IntentQueryTool::validate_intent_shape(intent_value) {
+                            tracing::warn!(
+                                "Intent shape validation failed for tool call '{}' - rejecting: {}",
+                                tool_call.name, e
+                            );
+                            return Ok(serde_json::json!({
+                                "error": "Invalid intent structure",
+                                "details": format!("{}", e),
+                                "tool": tool_call.name
+                            }).to_string());
+                        }
+
+                        // DEPENDENT OBJECT RULE ENFORCEMENT
+                        if let Err(e) = crate::tools::graphql::IntentQueryTool::validate_dependent_objects(&intent) {
+                            tracing::warn!(
+                                "Dependent object validation failed for tool call '{}' - rejecting: {}",
+                                tool_call.name, e
+                            );
+                            return Ok(serde_json::json!({
+                                "error": "Invalid attribute-target combination",
+                                "details": format!("{}", e),
+                                "tool": tool_call.name
+                            }).to_string());
+                        }
                         // ENFORCED NORMALIZATION ORDER: parse_intent → normalize_explicit_building_scope → normalize_filters
                         let original_scope = intent.scope.clone();
 
@@ -393,6 +443,11 @@ impl Executor {
                         tool_name: tool_call.name.clone(),
                     },
                     user_message: last_user_msg.clone(),
+                    parsed_intent: if tool_call.name == "query_intent" {
+                        parsed_intent.clone() // Pass the normalized intent for query_intent tool
+                    } else {
+                        None // Other tools don't use pre-parsed intents
+                    },
                 };
 
                 tracing::info!("Executing eligible tool: {}", tool_call.name);
