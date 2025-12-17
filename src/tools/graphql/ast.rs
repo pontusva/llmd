@@ -64,6 +64,16 @@ impl GqlQuery {
     pub fn to_string(&self) -> String {
         format!("query {{ {} }}", self.root.to_string())
     }
+
+    /// Pretty print the query with proper indentation
+    pub fn pretty_print(&self, indent: usize) -> String {
+        let indent_str = "  ".repeat(indent);
+        let mut result = format!("{}query {{\n", indent_str);
+        result.push_str(&self.root.pretty_print(indent + 1));
+        result.push('\n');
+        result.push_str(&format!("{}}}", indent_str));
+        result
+    }
 }
 
 impl GqlField {
@@ -91,6 +101,39 @@ impl GqlField {
 
         result
     }
+
+    /// Pretty print a field with proper indentation
+    fn pretty_print(&self, indent: usize) -> String {
+        let indent_str = "  ".repeat(indent);
+        let mut result = format!("{}{}\n", indent_str, self.name);
+
+        // Add arguments if present
+        if !self.arguments.is_empty() {
+            result.push_str(&format!("{}(\n", indent_str));
+            for (i, arg) in self.arguments.iter().enumerate() {
+                let arg_indent = "  ".repeat(indent + 1);
+                result.push_str(&format!("{}{}: {}\n", arg_indent, arg.name, arg.value.pretty_print(indent + 2)));
+            }
+            result.push_str(&format!("{})\n", indent_str));
+        }
+
+        // Add selection if present
+        if !self.selection.is_empty() {
+            result.push_str(&format!("{}{{\n", indent_str));
+            for field in &self.selection {
+                result.push_str(&field.pretty_print(indent + 1));
+                result.push('\n');
+            }
+            result.push_str(&format!("{}}}", indent_str));
+        } else {
+            // Remove trailing newline if no selection
+            if result.ends_with('\n') {
+                result.pop();
+            }
+        }
+
+        result
+    }
 }
 
 impl GqlValue {
@@ -109,6 +152,29 @@ impl GqlValue {
                         .collect::<Vec<_>>()
                         .join(", ");
                     format!("{{ {} }}", pairs_str)
+                }
+            }
+        }
+    }
+
+    /// Pretty print a GraphQL value with proper indentation
+    fn pretty_print(&self, indent: usize) -> String {
+        match self {
+            GqlValue::String(s) => format!(r#""{}""#, s),
+            GqlValue::Number(n) => n.to_string(),
+            GqlValue::Boolean(b) => b.to_string(),
+            GqlValue::Object(pairs) => {
+                if pairs.is_empty() {
+                    "{}".to_string()
+                } else {
+                    let indent_str = "  ".repeat(indent);
+                    let mut result = String::from("{\n");
+                    for (k, v) in pairs {
+                        result.push_str(&format!("{}{}: {}\n", indent_str, k, v.pretty_print(indent + 1)));
+                    }
+                    let closing_indent = "  ".repeat(indent - 1);
+                    result.push_str(&format!("{}}}", closing_indent));
+                    result
                 }
             }
         }
@@ -213,5 +279,62 @@ mod tests {
     fn field_without_arguments_or_selection() {
         let field = GqlField::new("id");
         assert_eq!(field.to_string(), "id");
+    }
+
+    #[test]
+    fn component_window_count_query_pretty() {
+        let where_clause = GqlValue::Object(vec![
+            ("buildingId".into(), GqlValue::String("mock-building-123".into())),
+            ("type".into(), GqlValue::String("window".into())),
+        ]);
+
+        let query = GqlQuery {
+            root: GqlField::new("components")
+                .arg("where", where_clause)
+                .select(
+                    GqlField::new("_count")
+                        .select(GqlField::new("id"))
+                ),
+        };
+
+        let expected = r#"query {
+  components(
+    where: {
+      buildingId: "mock-building-123"
+      type: "window"
+    }
+  ) {
+    _count {
+      id
+    }
+  }
+}"#;
+        assert_eq!(query.pretty_print(0), expected);
+    }
+
+    #[test]
+    fn building_list_query_pretty() {
+        let where_clause = GqlValue::Object(vec![
+            ("teamId".into(), GqlValue::String("team-123".into())),
+        ]);
+
+        let query = GqlQuery {
+            root: GqlField::new("buildings")
+                .arg("where", where_clause)
+                .select(GqlField::new("id"))
+                .select(GqlField::new("name")),
+        };
+
+        let expected = r#"query {
+  buildings(
+    where: {
+      teamId: "team-123"
+    }
+  ) {
+    id
+    name
+  }
+}"#;
+        assert_eq!(query.pretty_print(0), expected);
     }
 }

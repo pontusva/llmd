@@ -1654,7 +1654,7 @@ impl IntentQueryTool {
         };
 
         let query = GqlQuery { root: root_field };
-        Ok(query.to_string())
+        Ok(query.pretty_print(0))
     }
 
     /// Compile scope constraint using RelationMap

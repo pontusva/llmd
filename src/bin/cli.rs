@@ -188,11 +188,49 @@ async fn main() -> anyhow::Result<()> {
                     let body = response.text().await.unwrap_or_default();
 
                     if status.is_success() {
-                        stdout.write_all(body.as_bytes()).await?;
-                        stdout.write_all(b"\n").await?;
+                        match serde_json::from_str::<serde_json::Value>(&body) {
+                            Ok(json) => {
+                                if json.get("object") == Some(&serde_json::json!("compile.result")) {
+                                    if let Some(query) = json
+                                        .get("output")
+                                        .and_then(|o| o.get("data"))
+                                        .and_then(|d| d.get("compiled_query"))
+                                        .and_then(|q| q.as_str())
+                                    {
+                                stdout
+                                    .write_all("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n".as_bytes())
+                                    .await?;
+                                stdout
+                                    .write_all("📦 Compiled GraphQL Query\n".as_bytes())
+                                    .await?;
+                                stdout
+                                    .write_all("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n".as_bytes())
+                                    .await?;
+                                stdout.write_all(query.as_bytes()).await?;
+                                stdout.write_all("\n\n".as_bytes()).await?;
+                                stdout.flush().await?;
+                                    } else {
+                                        // Fallback if structure is unexpected
+                                        stdout.write_all(body.as_bytes()).await?;
+                                        stdout.write_all(b"\n").await?;
+                                    }
+                                } else {
+                                    // Not a compile result, print raw
+                                    stdout.write_all(body.as_bytes()).await?;
+                                    stdout.write_all(b"\n").await?;
+                                }
+                            }
+                            Err(_) => {
+                                // Not JSON, print raw
+                                stdout.write_all(body.as_bytes()).await?;
+                                stdout.write_all(b"\n").await?;
+                            }
+                        }
                         stdout.flush().await?;
                     } else {
-                        stdout.write_all(format!("❌ Compile failed ({}):\n{}\n", status, body).as_bytes()).await?;
+                        stdout.write_all(
+                            format!("❌ Compile failed ({}):\n{}\n", status, body).as_bytes()
+                        ).await?;
                         stdout.flush().await?;
                     }
                 }
