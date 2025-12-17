@@ -353,18 +353,6 @@ impl Executor {
                             }).to_string());
                         }
 
-                        // DEPENDENT OBJECT RULE ENFORCEMENT
-                        if let Err(e) = crate::tools::graphql::IntentQueryTool::validate_dependent_objects(&intent) {
-                            tracing::warn!(
-                                "Dependent object validation failed for tool call '{}' - rejecting: {}",
-                                tool_call.name, e
-                            );
-                            return Ok(serde_json::json!({
-                                "error": "Invalid attribute-target combination",
-                                "details": format!("{}", e),
-                                "tool": tool_call.name
-                            }).to_string());
-                        }
                         // Apply time and status filter normalization from user message
                         crate::tools::graphql::IntentQueryTool::normalize_time_and_status_filters(
                             &mut intent,

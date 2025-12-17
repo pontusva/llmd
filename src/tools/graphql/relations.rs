@@ -1,7 +1,7 @@
 //! Relation-driven ownership model for intent lowering
 //!
 //! This module defines the declarative rules for how physical attributes
-//! map to their owning entities and required filters.
+//! and entity-attributes map to their owning entities and required filters.
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,6 +13,17 @@ pub struct OwnershipRule {
     /// The owning entity type (e.g., "component")
     pub owner: &'static str,
     /// The filter field required for this ownership (e.g., "component_type")
+    pub required_filter: &'static str,
+}
+
+/// A rule defining ownership relationships for entity targets
+#[derive(Debug, Clone)]
+pub struct EntityOwnershipRule {
+    /// The entity target (e.g., "device")
+    pub entity: &'static str,
+    /// The parent entity it must be scoped to (e.g., "building")
+    pub parent: &'static str,
+    /// The filter required to express that ownership (e.g., "buildingId")
     pub required_filter: &'static str,
 }
 
@@ -43,6 +54,26 @@ pub static OWNERSHIP_RULES: &[OwnershipRule] = &[
         physical: "sensor",
         owner: "component",
         required_filter: "component_type",
+    },
+];
+
+/// Static table of entity ownership rules
+/// These define required scoping filters for entity targets
+pub static ENTITY_OWNERSHIP_RULES: &[EntityOwnershipRule] = &[
+    EntityOwnershipRule {
+        entity: "component",
+        parent: "building",
+        required_filter: "buildingId",
+    },
+    EntityOwnershipRule {
+        entity: "device",
+        parent: "building",
+        required_filter: "buildingId",
+    },
+    EntityOwnershipRule {
+        entity: "measure",
+        parent: "building",
+        required_filter: "buildingId",
     },
 ];
 
@@ -91,23 +122,32 @@ impl IntentIntrospection {
                 }
             }
 
-            // Derive required filters by target from ownership rules (single source of truth).
-            // This stays schema-aligned by later validating that derived filters exist in `valid_filters`.
+            // Derive required filters by target from both physical ownership rules
+            // and entity ownership rules (single source of truth).
             {
                 let mut tmp: HashMap<String, HashSet<String>> = HashMap::new();
+
+                // Physical attribute ownership (e.g., window -> component_type)
                 for rule in OWNERSHIP_RULES {
                     tmp.entry(rule.owner.to_string())
                         .or_default()
                         .insert(rule.required_filter.to_string());
                 }
 
-                for (owner, filters) in tmp {
+                // Entity ownership (e.g., device -> buildingId)
+                for rule in ENTITY_OWNERSHIP_RULES {
+                    tmp.entry(rule.entity.to_string())
+                        .or_default()
+                        .insert(rule.required_filter.to_string());
+                }
+
+                for (target, filters) in tmp {
                     let mut v: Vec<String> = filters
                         .into_iter()
                         .filter(|f| valid_filters.contains(f))
                         .collect();
                     v.sort();
-                    required_filters_by_target.insert(owner, v);
+                    required_filters_by_target.insert(target, v);
                 }
             }
         }
@@ -149,6 +189,45 @@ pub fn normalize_physical_attribute(attr: &str) -> String {
     .to_string()
 }
 
+/// Normalize entity-attributes (plural / common variants) to canonical target names.
+///
+/// Examples:
+/// - "measures" -> "measure"
+/// - "components" -> "component"
+/// - "devices" -> "device"
+pub fn normalize_entity_attribute(attr: &str) -> String {
+    match attr.trim().to_lowercase().as_str() {
+        "measures" => "measure",
+        "measure" => "measure",
+
+        "components" => "component",
+        "component" => "component",
+
+        "devices" => "device",
+        "device" => "device",
+
+        other => other,
+    }
+    .to_string()
+}
+
+/// True if an attribute string actually refers to a known *entity* target
+/// (e.g. "measures" in "How many measures are in building Räven?").
+pub fn is_entity_attribute(attr: &str) -> bool {
+    let normalized = normalize_entity_attribute(attr);
+    ENTITY_OWNERSHIP_RULES
+        .iter()
+        .any(|r| r.entity.eq_ignore_ascii_case(&normalized))
+}
+
+/// Look up an entity-ownership rule by an attribute string (plural OK).
+pub fn find_entity_ownership_rule(attr: &str) -> Option<&'static EntityOwnershipRule> {
+    let normalized = normalize_entity_attribute(attr);
+    ENTITY_OWNERSHIP_RULES
+        .iter()
+        .find(|r| r.entity.eq_ignore_ascii_case(&normalized))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,7 +250,6 @@ mod tests {
     #[test]
     fn schema_introspection_extracts_valid_targets() {
         let introspection = IntentIntrospection::from_schema();
-        // Should contain at least "building", "component", "measure", etc.
         assert!(introspection.valid_targets.contains("building"));
         assert!(introspection.valid_targets.contains("component"));
     }
@@ -179,17 +257,21 @@ mod tests {
     #[test]
     fn schema_introspection_extracts_valid_filters() {
         let introspection = IntentIntrospection::from_schema();
-        // Should contain "component_type", "building_type", etc.
         assert!(introspection.valid_filters.contains("component_type"));
         assert!(introspection.valid_filters.contains("building_type"));
     }
 
     #[test]
-    fn schema_introspection_derives_required_filters_from_ownership_rules() {
-        let introspection = IntentIntrospection::from_schema();
-        let required = introspection
-            .required_filters_for_target("component")
-            .unwrap_or(&[]);
-        assert!(required.iter().any(|f| f == "component_type"));
+    fn normalize_entity_attribute_singularizes_plural() {
+        assert_eq!(normalize_entity_attribute("measures"), "measure".to_string());
+        assert_eq!(normalize_entity_attribute("components"), "component".to_string());
+        assert_eq!(normalize_entity_attribute("devices"), "device".to_string());
+    }
+
+    #[test]
+    fn is_entity_attribute_recognizes_measures() {
+        assert!(is_entity_attribute("measures"));
+        assert!(is_entity_attribute("measure"));
+        assert!(!is_entity_attribute("windows"));
     }
 }

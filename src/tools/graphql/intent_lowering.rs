@@ -5,7 +5,15 @@
 
 use crate::tools::graphql::{Intent, Target, Filters, ScopeType};
 use crate::tools::graphql::NameResolutionRegistry;
-use super::relations::{find_ownership_rule, IntentIntrospection, is_physical_attribute};
+use super::relations::{
+    find_ownership_rule,
+    IntentIntrospection,
+    is_physical_attribute,
+    normalize_physical_attribute,
+    is_entity_attribute,
+    normalize_entity_attribute,
+    find_entity_ownership_rule,
+};
 use std::sync::OnceLock;
 
 /// Global introspection data - computed once at startup
@@ -117,7 +125,7 @@ fn normalize_component_type_filter(intent: &mut Intent) {
     // If the component_type looks like a physical attribute (including plural forms),
     // normalize it to canonical singular form.
     if is_physical_attribute(component_type) {
-        let normalized = super::relations::normalize_physical_attribute(component_type);
+        let normalized = normalize_physical_attribute(component_type);
         filters.component_type = Some(normalized);
     }
 }
@@ -129,10 +137,30 @@ fn normalize_component_type_filter(intent: &mut Intent) {
 pub fn lower_intent(intent: &mut Intent) -> Result<(), LoweringError> {
     let introspection = INTROSPECTION.get().ok_or(LoweringError::NotInitialized)?;
 
-    // Only lower intents with physical attributes
-    if let Some(attribute) = &intent.attribute {
-        if is_physical_attribute(attribute) {
+    if let Some(attribute) = intent.attribute.clone() {
+        // Normalize once up front
+        let normalized = normalize_entity_attribute(&attribute);
+
+        // Case 1: physical attribute (windows, doors, etc.)
+        if is_physical_attribute(&normalized) {
             return lower_physical_attribute(intent, introspection);
+        }
+
+        // Case 2: entity attribute (measures, components, devices, etc.)
+        if let Some(rule) = find_entity_ownership_rule(&normalized) {
+            intent.target = match rule.entity {
+                "building" => Target::Building,
+                "component" => Target::Component,
+                "measure" => Target::Measure,
+                "real_estate" => Target::RealEstate,
+                "project" => Target::Project,
+                "plan" => Target::Plan,
+                other => return Err(LoweringError::InvalidLoweredTarget(other.to_string())),
+            };
+
+            // Entity attributes never survive lowering
+            intent.attribute = None;
+            return Ok(());
         }
     }
 
@@ -145,7 +173,7 @@ fn lower_physical_attribute(intent: &mut Intent, introspection: &IntentIntrospec
         .expect("Attribute must exist for physical lowering");
 
     // Normalize the attribute to canonical form before looking up rules
-    let normalized_attribute = super::relations::normalize_physical_attribute(attribute);
+    let normalized_attribute = normalize_physical_attribute(attribute);
 
     let rule = find_ownership_rule(&normalized_attribute)
         .ok_or_else(|| LoweringError::UnknownPhysicalAttribute(attribute.clone()))?;
@@ -253,6 +281,18 @@ pub fn validate_lowered_intent(intent: &Intent) -> Result<(), LoweringError> {
         if is_physical_attribute(attribute) {
             return Err(LoweringError::InvalidLoweredTarget(
                 format!("Physical attribute '{}' must be lowered to filters, not remain as attribute", attribute)
+            ));
+        }
+    }
+
+    // Entity attributes must NEVER exist post-lowering
+    if let Some(attribute) = &intent.attribute {
+        if is_entity_attribute(attribute) {
+            return Err(LoweringError::InvalidLoweredTarget(
+                format!(
+                    "Entity attribute '{}' must be lowered to target before compilation",
+                    attribute
+                )
             ));
         }
     }
@@ -433,5 +473,37 @@ mod tests {
         normalize_component_type_filter(&mut intent);
 
         assert_eq!(intent.filters.as_ref().unwrap().component_type, Some("window".to_string()));
+    }
+
+    #[test]
+    fn measures_in_building_lowers_to_measure_target() {
+        use crate::tools::graphql::{Action, Scope, ScopeType};
+        use crate::tools::graphql::MockNameRegistry;
+
+        initialize_lowering();
+
+        let mut intent = Intent {
+            action: Action::Count,
+            target: Target::Building,
+            attribute: Some("measures".to_string()),
+            scope: Scope {
+                r#type: ScopeType::Building,
+                building_id: None,
+                building_name: Some("Räven".to_string()),
+                real_estate_id: None,
+                real_estate_name: None,
+            },
+            metric: None,
+            filters: None,
+            limit: None,
+            group_by: None,
+        };
+
+        let registry = MockNameRegistry;
+        normalize_intent(&mut intent, &registry).unwrap();
+
+        assert_eq!(intent.target, Target::Measure);
+        assert!(intent.attribute.is_none());
+        assert!(intent.scope.building_id.is_some());
     }
 }
