@@ -13,10 +13,14 @@ async fn main() -> anyhow::Result<()> {
     let mut arg_persona: Option<String> = None;
     let mut arg_list_models: bool = false;
     let mut memory_enabled: bool = false; // Default: memory disabled
+    let mut compile_mode: bool = false; // Default: chat mode
     let mut i = 1; // Skip program name
 
     while i < args.len() {
         match args[i].as_str() {
+            "--compile" => {
+                compile_mode = true;
+            }
             "--model" => {
                 if i + 1 < args.len() {
                     arg_model = Some(args[i + 1].clone());
@@ -131,10 +135,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("🤖 Chat with LLM (tools enabled) — type /exit to quit");
-    println!("🧠 Using LLM: {}", model);
-    println!("👤 Using persona: {}", persona);
-    println!("💾 Memory: {}", if memory_enabled { "enabled" } else { "disabled" });
+    if compile_mode {
+        println!("🧠 Intent compiler mode — type /exit to quit");
+        println!("🧠 Using LLM: {}", model);
+    } else {
+        println!("🤖 Chat mode (tools disabled) — type /exit to quit");
+        println!("🧠 Using LLM: {}", model);
+        println!("👤 Using persona: {}", persona);
+        println!("💾 Memory: {}", if memory_enabled { "enabled" } else { "disabled" });
+    }
 
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
@@ -160,58 +169,92 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
 
-        // Make non-streaming HTTP request
-        let memory_update = if memory_enabled {
-            serde_json::Value::Null
+        if compile_mode {
+            // Compile mode: use /v1/compile endpoint
+            let payload = json!({
+                "model": model.clone(),
+                "input": input
+            });
+
+            match client
+                .post(format!("{}/v1/compile", base_url))
+                .header("Content-Type", "application/json")
+                .body(payload.to_string())
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+
+                    if status.is_success() {
+                        stdout.write_all(body.as_bytes()).await?;
+                        stdout.write_all(b"\n").await?;
+                        stdout.flush().await?;
+                    } else {
+                        stdout.write_all(format!("❌ Compile failed ({}):\n{}\n", status, body).as_bytes()).await?;
+                        stdout.flush().await?;
+                    }
+                }
+                Err(e) => {
+                    stdout.write_all(format!("❌ HTTP error: {}\n", e).as_bytes()).await?;
+                    stdout.flush().await?;
+                }
+            }
         } else {
-            serde_json::Value::String("disable".to_string())
-        };
+            // Chat mode: use /v1/chat/completions endpoint
+            let memory_update = if memory_enabled {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String("disable".to_string())
+            };
 
-        let payload = json!({
-            "model": model.clone(),
-            "messages": [{"role": "user", "content": input}],
-            "stream": false,
-            "persona": persona.clone(),
-            "memory_update": memory_update
-        });
+            let payload = json!({
+                "model": model.clone(),
+                "messages": [{"role": "user", "content": input}],
+                "stream": false,
+                "persona": persona.clone(),
+                "memory_update": memory_update
+            });
 
-        match client
-            .post(format!("{}/v1/chat/completions", base_url))
-            .header("Content-Type", "application/json")
-            .body(payload.to_string())
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    match response.json::<serde_json::Value>().await {
-                        Ok(json_response) => {
-                            if let Some(choices) = json_response.get("choices").and_then(|c| c.as_array()) {
-                                if let Some(choice) = choices.get(0) {
-                                    if let Some(message) = choice.get("message") {
-                                        if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
-                                            // Print the full response
-                                            stdout.write_all(content.as_bytes()).await?;
-                                            stdout.write_all(b"\n").await?;
-                                            stdout.flush().await?;
+            match client
+                .post(format!("{}/v1/chat/completions", base_url))
+                .header("Content-Type", "application/json")
+                .body(payload.to_string())
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        match response.json::<serde_json::Value>().await {
+                            Ok(json_response) => {
+                                if let Some(choices) = json_response.get("choices").and_then(|c| c.as_array()) {
+                                    if let Some(choice) = choices.get(0) {
+                                        if let Some(message) = choice.get("message") {
+                                            if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
+                                                // Print the full response
+                                                stdout.write_all(content.as_bytes()).await?;
+                                                stdout.write_all(b"\n").await?;
+                                                stdout.flush().await?;
+                                            }
                                         }
                                     }
                                 }
                             }
+                            Err(e) => {
+                                stdout.write_all(format!("❌ Failed to parse response: {}\n", e).as_bytes()).await?;
+                                stdout.flush().await?;
+                            }
                         }
-                        Err(e) => {
-                            stdout.write_all(format!("❌ Failed to parse response: {}\n", e).as_bytes()).await?;
-                            stdout.flush().await?;
-                        }
+                    } else {
+                        stdout.write_all(format!("❌ Request failed: {}\n", response.status()).as_bytes()).await?;
+                        stdout.flush().await?;
                     }
-                } else {
-                    stdout.write_all(format!("❌ Request failed: {}\n", response.status()).as_bytes()).await?;
+                }
+                Err(e) => {
+                    stdout.write_all(format!("❌ HTTP error: {}\n", e).as_bytes()).await?;
                     stdout.flush().await?;
                 }
-            }
-            Err(e) => {
-                stdout.write_all(format!("❌ HTTP error: {}\n", e).as_bytes()).await?;
-                stdout.flush().await?;
             }
         }
     }

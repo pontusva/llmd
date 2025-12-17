@@ -223,6 +223,7 @@ impl Executor {
         system_prompt_override: Option<&str>,
         memory_update: Option<&str>,
         options: GenerateOptions,
+        allow_tools: bool,
     ) -> anyhow::Result<String> {
         let persona_name = persona.unwrap_or("default");
 
@@ -292,7 +293,8 @@ impl Executor {
         let reply = llm.generate_with_options(opts).await?;
 
         // Parse model output for tool calls
-        if let Some(tool_call) = parse_tool_call(&reply) {
+        if allow_tools {
+            if let Some(tool_call) = parse_tool_call(&reply) {
             // Tool call detected - validate tool registry and eligibility
             tracing::info!("Tool call detected: {} with arguments {:?}", tool_call.name, tool_call.arguments);
 
@@ -614,6 +616,16 @@ impl Executor {
             tracing::warn!("Rejected unsafe plain text response");
             Ok("I apologize, but I encountered an error processing your request.".to_string())
         }
+        } else {
+            // Tools disabled - return response as-is if safe
+            let safe_reply = Self::strip_chatml(&reply);
+            if self.validate_response(&safe_reply, false) {
+                Ok(safe_reply)
+            } else {
+                tracing::warn!("Rejected unsafe plain text response (tools disabled)");
+                Ok("I apologize, but I encountered an error processing your request.".to_string())
+            }
+        }
     }
 
     /// Execute a streaming chat completion request.
@@ -627,6 +639,7 @@ impl Executor {
         system_prompt_override: Option<&str>,
         memory_update: Option<&str>,
         options: GenerateOptions,
+        allow_tools: bool,
     ) -> anyhow::Result<(Box<dyn Stream<Item = String> + Send + Unpin>, MemoryUpdateTask)> {
         let persona_name = persona.unwrap_or("default").to_string();
 

@@ -135,6 +135,20 @@ pub struct IndexRequest {
 }
 
 #[derive(Deserialize)]
+pub struct CompileRequest {
+    pub model: String,
+    pub input: String,
+}
+
+#[derive(Serialize)]
+pub struct CompileResponse {
+    pub id: String,
+    pub object: String, // "compile.result"
+    pub model: String,
+    pub output: serde_json::Value,
+}
+
+#[derive(Deserialize)]
 pub struct SearchRequest {
     pub query: String,
     pub k: Option<usize>,
@@ -152,6 +166,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/embeddings", post(embedding_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/chat/completions", post(chat_handler))
+        .route("/v1/compile", post(compile_handler))
         .route("/v1/persona/:persona/memory", get(persona_memory_get))
         .route("/v1/persona/:persona/memory/reset", post(persona_memory_reset))
 }
@@ -324,6 +339,7 @@ async fn chat_handler(
             req.system_prompt.as_deref(),
             req.memory_update.as_deref(),
             opts,
+            false, // 🚫 tools disabled
         ).await {
             Ok(result) => result,
             Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
@@ -376,6 +392,7 @@ async fn chat_handler(
             req.system_prompt.as_deref(),
             req.memory_update.as_deref(),
             opts,
+            false, // 🚫 tools disabled
         ).await {
             Ok(r) => r,
             Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
@@ -399,6 +416,71 @@ async fn chat_handler(
 
         (StatusCode::OK, Json(resp)).into_response()
     }
+}
+
+async fn compile_handler(
+    State(state): State<AppState>,
+    Json(req): Json<CompileRequest>,
+) -> impl IntoResponse {
+    // 1) Resolve model
+    let llm = match state.llms.get(&req.model) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Unknown model {}", req.model),
+            ).into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load model {}: {}", req.model, e),
+            ).into_response();
+        }
+    };
+
+    // 2) Single user message
+    let messages = vec![crate::llm::ChatMessage {
+        role: "user".to_string(),
+        content: req.input.clone(),
+    }];
+
+    // 3) Generation options
+    let mut opts = crate::llm::GenerateOptions::default();
+    opts.messages = messages.clone();
+
+    // 4) Execute compiler (TOOLS ENABLED)
+    let raw = match state.executor.execute_chat(
+        llm,
+        messages,
+        Some("minimal"),
+        crate::runtime::executor::PromptRole::IntentCompiler,
+        None,                // 🚫 no system override
+        Some("disable"),     // 🚫 no memory
+        opts,
+        true,                // ✅ tools ENABLED
+    ).await {
+        Ok(r) => r,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+            ).into_response();
+        }
+    };
+
+    // 5) Parse tool output into JSON
+    let output = serde_json::from_str(&raw)
+        .unwrap_or_else(|_| json!({ "type": "text", "content": raw }));
+
+    let resp = CompileResponse {
+        id: format!("compile-{}", Uuid::new_v4()),
+        object: "compile.result".to_string(),
+        model: req.model,
+        output,
+    };
+
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 async fn delete_handler(
