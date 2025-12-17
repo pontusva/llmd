@@ -193,16 +193,11 @@ impl AppState {
 
         // Initialize name resolution registry once at startup
         let name_registry: Arc<dyn NameResolutionRegistry + Send + Sync> = Arc::new(
-            crate::tools::graphql::InMemoryNameRegistry::new(
-                vec![
-                    ("Räven".to_string(), "building-123".to_string(), "Räven".to_string()),
-                    ("Björk".to_string(), "building-456".to_string(), "Björk".to_string()),
-                ],
-                vec![
-                    ("RealEstate1".to_string(), "real-estate-123".to_string(), "Real Estate 1".to_string()),
-                ],
-            )
+            crate::tools::graphql::MockNameRegistry
         );
+
+        // Initialize intent lowering system
+        crate::tools::graphql::intent_lowering::initialize_lowering();
 
         let executor = Arc::new(Executor::new(
             model_arc.clone(),

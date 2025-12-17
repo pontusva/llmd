@@ -315,8 +315,6 @@ impl Executor {
                 // Parse the intent from tool arguments
                 match crate::tools::graphql::IntentQueryTool::parse_intent(&tool_call.arguments.args) {
                     Ok(mut intent) => {
-                        // 🔒 EXECUTOR NORMALIZATION STEP: Physical attribute ownership rewrite
-                        crate::tools::graphql::IntentQueryTool::rewrite_physical_attribute_ownership(&mut intent);
                         // EXECUTOR GUARDRAIL: Validate intent shape BEFORE any processing
                         // Extract the intent value from the payload and validate it
                         let payload_obj = match tool_call.arguments.args.as_object() {
@@ -367,51 +365,24 @@ impl Executor {
                                 "tool": tool_call.name
                             }).to_string());
                         }
-                        // ENFORCED NORMALIZATION ORDER: parse_intent → normalize_explicit_building_scope → normalize_filters
-                        let original_scope = intent.scope.clone();
-
-                        // CRITICAL: Normalize building scope FIRST (before any other normalization)
-                        if let Err(e) = crate::tools::graphql::IntentQueryTool::normalize_explicit_building_scope(
-                            &mut intent,
-                            &last_user_msg,
-                            &*self.name_registry
-                        ) {
-                            tracing::warn!(
-                                "Building scope normalization failed for tool call '{}' - rejecting: {}",
-                                tool_call.name, e
-                            );
-                            // Unknown building = hard stop, return structured error
-                            return Ok(serde_json::json!({
-                                "error": "Invalid building reference",
-                                "details": format!("{}", e),
-                                "tool": tool_call.name
-                            }).to_string());
-                        }
-
-                        // Log normalization decisions
-                        if original_scope.r#type != intent.scope.r#type {
-                            tracing::info!(
-                                "Intent normalization: scope changed from {:?} to {:?}",
-                                original_scope.r#type,
-                                intent.scope.r#type
-                            );
-                        }
-
-                        // POST-NORMALIZATION INVARIANT: Building mention MUST override current_team
-                        if last_user_msg.to_lowercase().contains("building")
-                            && matches!(intent.scope.r#type, crate::tools::graphql::ScopeType::CurrentTeam)
-                        {
-                            return Ok(serde_json::json!({
-                                "error": "Building mentioned but scope not resolved",
-                                "tool": tool_call.name
-                            }).to_string());
-                        }
-
                         // Apply time and status filter normalization from user message
                         crate::tools::graphql::IntentQueryTool::normalize_time_and_status_filters(
                             &mut intent,
                             &last_user_msg
                         );
+
+                        // Normalize and lower intent from logical to physical representation
+                        if let Err(e) = crate::tools::graphql::intent_lowering::normalize_intent(&mut intent, &*self.name_registry) {
+                            tracing::warn!(
+                                "Lowered intent validation failed for tool call '{}' - rejecting: {}",
+                                tool_call.name, e
+                            );
+                            return Ok(serde_json::json!({
+                                "error": "Invalid lowered intent",
+                                "details": format!("{}", e),
+                                "tool": tool_call.name
+                            }).to_string());
+                        }
 
                         Some(intent)
                     },
