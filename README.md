@@ -1,212 +1,315 @@
-# LLM Inference Server
+llmd — LLM Intent Compiler & Execution Runtime
 
-A client-server system for interacting with large language models. Features advanced memory management, persona-based conversations, and vector similarity search. Models are loaded via the companion `model-loader` tool.
+llmd is a secure, deterministic runtime for using Large Language Models (LLMs) as intent compilers, not free-form chatbots.
 
-## Architecture
+It translates natural language into strict, validated intents, executes them through guarded tools, and optionally returns conversational responses — all while enforcing grammar, scope, and security constraints.
 
-The system consists of two components:
+This architecture is designed for production systems, not demos.
 
-1. **`llmd` (Server)**: Long-running inference server that loads models and handles all memory/embedding logic
-2. **`cli` (Client)**: Thin terminal client that connects to the server via HTTP
+⸻
 
-## Overview
+## What llmd Is (and Is Not)
 
-The inference server provides an OpenAI-compatible API with support for multiple LLM models, persona-based memory management, and intelligent context retrieval using both keyword and vector-based semantic search.
+llmd is
+• An LLM-driven intent compiler
+• A grammar-enforced execution runtime
+• A secure gateway to structured data
+• A tool orchestration system with guardrails
+• A persona-aware conversational system
 
-## Quick Start
+llmd is not
+• A “best-effort” chatbot
+• A prompt-only system
+• A model that queries databases directly
+• A system that guesses or hallucinates missing data
 
-### 1. Start the Server
+If llmd cannot produce a valid, safe intent, it will reject the request.
 
-```bash
-# Load a model using the model-loader tool (from separate repository)
-# This creates a LoadPlan that gets piped to the server
-model-loader --model phi-2 | cargo run --bin llmd
+⸻
 
-# Server will start on http://localhost:3000
+## High-Level Architecture
+
+llmd separates understanding, decision, and execution into explicit stages:
+
+User Input
+↓
+Intent Compilation (LLM, grammar-constrained)
+↓
+Intent Normalization & Validation (executor)
+↓
+Capability & Scope Checks
+↓
+Tool Execution (deterministic)
+↓
+Optional Natural-Language Response
+
+Each stage has hard boundaries. The LLM does not bypass them.
+
+⸻
+
+## Core Components
+
+### 1. Intent Compiler (LLM)
+
+The LLM’s primary role is to compile natural language into structured intent.
+
+Example:
+
+"How many measures are in building Räven?"
+
+⬇️
+
+```json
+{
+  "action": "count",
+  "target": "measure",
+  "scope": {
+    "type": "building",
+    "building_name": "Räven"
+  }
+}
 ```
 
-### 2. Use the Client
+The LLM:
+• Must follow a strict grammar
+• Must emit valid JSON
+• Must not invent filters, scopes, or entities
+
+If it violates the grammar, the request is rejected.
+
+⸻
+
+### 2. Intent Grammar (First-Class Concept)
+
+All executable requests conform to a formal grammar:
+
+| Field     | Description                                            |
+| --------- | ------------------------------------------------------ |
+| action    | What to do (count, list, get, aggregate, …)            |
+| target    | Structural entity (building, measure, component, …)    |
+| scope     | Context boundary (current_team, building, real_estate) |
+| attribute | Dependent physical object (windows, doors, …)          |
+| filters   | Optional constraints (status, completed, year_min, …)  |
+
+Structural vs Physical Objects
+• Structural entities → valid target
+• building, measure, component, plan, project, realEstate
+• Physical/dependent objects → attribute only
+• windows, doors, rooms, pipes, sensors
+
+Example:
+
+"How many windows are in building Björk?"
+
+```json
+{
+  "action": "count",
+  "target": "building",
+  "attribute": "windows",
+  "scope": {
+    "type": "building",
+    "building_name": "Björk"
+  }
+}
+```
+
+⸻
+
+### 3. Executor (Authority Boundary)
+
+The executor is the source of truth.
+
+It is responsible for:
+• Validating intent shape (JSON Schema)
+• Normalizing scopes and filters
+• Resolving human-readable names
+• Enforcing capability rules
+• Executing tools deterministically
+
+The executor can:
+• Reject invalid intents
+• Reject unresolved scopes
+• Reject unsupported filters
+• Reject unsafe execution
+
+The LLM cannot override this.
+
+⸻
+
+### 4. Tool System (Deterministic Execution)
+
+Tools are:
+• Explicitly registered
+• Schema-validated
+• Capability-checked
+• Executed with strict inputs
+
+Example tool:
+• query_intent — compile intent → GraphQL query
+
+Tools are execution authority, not the LLM.
+
+⸻
+
+### 5. Name Resolution & Scoping
+
+Human-friendly names (e.g. “Räven”) are resolved via a NameResolutionRegistry, scoped per team.
+• Resolution happens before execution
+• Unknown names cause rejection
+• No guessing or fallback logic
+
+This prevents:
+• Cross-tenant data leaks
+• Ambiguous execution
+• Silent mis-scoping
+
+⸻
+
+### 6. Relation Mapping
+
+Targets and scopes are connected through an explicit relation map.
+
+Example:
+• measure scoped by building →
+
+measure → component → building
+
+This guarantees:
+• Correct query generation
+• No accidental joins
+• No implicit assumptions
+
+⸻
+
+### 7. Memory System (Supporting Role)
+
+llmd includes a multi-layer memory system:
+• Persona memory
+• Conversation memory
+• Fact memory
+• Vector and keyword retrieval
+
+Memory:
+• Improves conversational continuity
+• Provides context for intent compilation
+
+Memory never:
+• Changes execution results
+• Overrides intent grammar
+• Bypasses validation
+
+⸻
+
+## Modes of Operation
+
+llmd operates in multiple modes, depending on user intent:
+
+### Conversational Mode
+
+• Free-form chat
+• No tools
+• Natural language only
+
+### Compiler Mode
+
+• User requests data or actions
+• LLM emits structured intent
+• Tools may be executed
+
+### Execution Mode
+
+• Strict schema validation
+• Deterministic results
+• Optional natural-language summary
+
+These modes are enforced automatically.
+
+⸻
+
+## Security & Safety Model
+
+llmd is designed for production safety:
+• No prompt injection into execution
+• No arbitrary code or query execution
+• No implicit data access
+• No silent failures
+
+If something cannot be done safely, it is not done.
+
+This makes llmd suitable for:
+• Internal tools
+• Regulated environments
+• Multi-tenant systems
+• Audit-heavy organizations
+
+### Why Not "Just Use ChatGPT / Copilot"?
+
+| Chat Systems         | llmd                    |
+| -------------------- | ----------------------- |
+| Free-form text       | Grammar-constrained     |
+| Best-effort answers  | Deterministic execution |
+| Hallucination-prone  | Rejects invalid output  |
+| No scope enforcement | Explicit scope          |
+| No audit trail       | Structured intents      |
+| Hard to secure       | Built for security      |
+
+llmd treats LLMs as compilers, not oracles.
+
+⸻
+
+## Running llmd
+
+### Start the Server
 
 ```bash
-# Start interactive chat
+LLMD_LLM_BACKEND=ollama \
+LLMD_OLLAMA_MODEL=llama3.1:8b \
+cargo run --bin llmd
+```
+
+http://localhost:3000
+
+```bash
 cargo run --bin cli
-
-# List available models (from running server)
-cargo run --bin cli -- --list-models
-
-# Chat with specific persona
-cargo run --bin cli -- --persona assistant
 ```
 
-## CLI Arguments
+Optional flags:
+• --persona <name>
+• --stream
+• --list-models
 
-### Model Selection
-
-- `--list-models`
-
-  - Query the server and display all available LLM models
-  - No other arguments processed when this flag is present
-
-- `--model <MODEL_NAME>` (optional)
-  - Specify which model to use (if multiple are loaded)
-  - Default: Auto-discover first available model from server
-
-### System and Persona Configuration
-
-- `--system <PROMPT>`
-
-  - Override the default system prompt
-  - Example: `--system "You are a helpful coding assistant"`
-
-- `--persona <NAME>`
-  - Select which persona memory to use
-  - Personas maintain separate memory contexts
-  - Default: "default"
-  - Example: `--persona coder`, `--persona writer`
-
-### Response Control
-
-- `--stream`
-  - Enable streaming responses (token-by-token output)
-  - Default: False (wait for complete response)
-
-### Memory Control
-
-The CLI includes memory control options that are sent to the server:
-
-- `--persona <NAME>`
-  - Select which persona memory context to use
-  - Personas maintain separate memory contexts on the server
-  - Default: "minimal" (fast, minimal prompt)
-  - Available: "default", "minimal", "rogue", "developer", "therapist", "pirate", "yoda"
-
-## Interactive Commands
-
-Once in chat mode, use these commands:
-
-- `/exit` - Exit the chat session
-
-## Memory System
-
-The inference server uses a sophisticated multi-layered memory system:
-
-### Memory Types
-
-1. **Persona Memory**: Identity, preferences, and stable facts about the persona
-2. **Conversation Memory**: Dialogue context and recent interactions
-3. **Fact Memory**: Explicit facts and information
-
-### Memory Storage
-
-- **Keyword-based**: Simple text matching and retrieval
-- **Vector-based**: Semantic similarity using embeddings (requires embedding model)
-
-### Intelligent Memory Policies
-
-- **Auto Policy**: Automatically determines storage strategy based on content type
-- **Append Policy**: Adds new information without replacing existing content
-- **Replace Policy**: Updates existing memories with new information
-
-## Examples
-
-### Basic Usage
-
-```bash
-# 1. Start server with loaded model
-model-loader --model phi-2 | cargo run --bin llmd
-
-# 2. In another terminal, start chat
-cargo run --bin cli
-```
-
-### Server Options
-
-```bash
-# Load different model
-model-loader --model tinyllama | cargo run --bin llmd
-
-# Server runs on http://localhost:3000 by default
-```
-
-### Client Options
-
-```bash
-# Use specific persona
-cargo run --bin cli -- --persona developer
-
-# List available models from server
-cargo run --bin cli -- --list-models
-```
+⸻
 
 ## Model Loading
 
-⚠️ **Important**: Models are loaded by the separate `model-loader` repository, not this one.
-
-### Using the Model Loader
-
-Models are loaded using the companion `model-loader` tool:
+Models are loaded via the companion model-loader tool (separate repository).
 
 ```bash
-# Install model-loader (from separate repository)
-git clone https://github.com/your-org/model-loader.git
-cd model-loader
-cargo build --release
-
-# Load a model and start the server
-./target/release/model-loader --model phi-2 | cargo run --bin llmd
+model-loader --model llama3.1 | cargo run --bin llmd
 ```
 
-The model-loader handles:
+The loader handles:
+• Downloads
+• Caching
+• Load plans
+• Streaming models into llmd
 
-- Downloading model weights from Hugging Face
-- Creating optimized LoadPlans
-- Streaming models to the inference server
-
-### Supported Models
-
-The server supports models loaded via LoadPlan:
-
-- **Llama models**: Llama 2, Llama 3, Llama 3.2
-- **Mistral models**: Mistral 7B, Mixtral
-- **Phi models**: Phi-2, Phi-3
-- **Other architectures**: As supported by `candle-transformers`
-
-Models are automatically detected and made available through the `/v1/models` API endpoint.
-
-## Requirements
-
-- Rust toolchain
-- Running `model-loader` instance (separate repository)
-- Server started with model LoadPlan piped from stdin
+⸻
 
 ## API Endpoints
 
-The server provides OpenAI-compatible endpoints:
+• GET /v1/models
+• POST /v1/chat/completions
+• GET /v1/persona/:persona/memory
+• POST /v1/persona/:persona/memory/reset
 
-- `GET /v1/models` - List available models
-- `POST /v1/chat/completions` - Chat completions with memory support
-- `GET /v1/persona/:persona/memory` - Get persona memory
-- `POST /v1/persona/:persona/memory/reset` - Reset persona memory
+OpenAI-compatible where applicable.
 
-## Troubleshooting
+⸻
 
-### Server Won't Start
+## Design Philosophy (TL;DR)
 
-- Ensure model-loader is properly configured
-- Check that LoadPlan is being piped to server stdin
-- Verify model files exist in model-loader's cache
+LLMs should suggest intent.
+Systems should decide execution.
 
-### Model Not Found
-
-- Use `cargo run --bin cli -- --list-models` to check available models
-- Ensure model was properly loaded by model-loader
-
-### Connection Issues
-
-- Verify server is running on http://localhost:3000
-- Check that model-loader successfully created LoadPlan
-
-### Performance Issues
-
-- Use `--persona minimal` for fastest responses
-- Memory operations happen server-side automatically
+llmd exists to make that separation explicit, enforceable, and safe.
