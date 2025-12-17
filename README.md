@@ -1,4 +1,4 @@
-llmd — Intent Compilation & Execution Runtime (LLM-Driven)
+## llmd — Intent Compilation & Execution Runtime (LLM-Driven)
 
 llmd is a secure, deterministic runtime for using Large Language Models (LLMs) as intent compilers, not free-form chatbots.
 
