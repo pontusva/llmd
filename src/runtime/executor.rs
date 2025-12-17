@@ -10,6 +10,18 @@ use crate::tools::graphql::NameResolutionRegistry;
 use futures::Stream;
 use serde_json;
 
+/// Prompt role determines which type of system prompt to use
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PromptRole {
+    IntentCompiler,
+    Conversational,
+}
+
+/// Static intent compiler prompt - immutable and tool-agnostic
+pub fn intent_compiler_prompt() -> &'static str {
+    include_str!("../prompts/intent_compiler.txt")
+}
+
 /// Executor context containing per-request dependencies
 pub struct ExecutorContext {
     pub name_registry: Arc<dyn NameResolutionRegistry + Send + Sync>,
@@ -129,7 +141,7 @@ impl Executor {
     }
 
     /// Build enhanced system prompt that includes available tools
-    fn build_enhanced_system_prompt(&self, override_prompt: Option<&str>) -> Option<String> {
+    fn build_chat_system_prompt(&self, override_prompt: Option<&str>) -> Option<String> {
         if let Some(prompt) = override_prompt {
             // If there's an override, enhance it with tool information
             let available_tools = self.tool_registry.list_tools();
@@ -144,14 +156,14 @@ impl Executor {
             );
             Some(enhanced)
         } else {
-            // No override, check if we should add tool information to default prompt
+            // For chat mode, provide enhanced prompt with tools
             let available_tools = self.tool_registry.list_tools();
             if available_tools.is_empty() {
                 None
             } else {
                 let tools_list = available_tools.join(", ");
                 let enhanced = format!(
-                    "You are an Intent Compiler.\n\nYour ONLY task is to translate user questions into a STRICT Intent JSON that conforms EXACTLY to the provided schema and rules.\n\nYou do NOT reason about dates, years, or time ranges.\nYou do NOT invent filters.\nYou do NOT infer temporal constraints.\n\n────────────────────────────────────\nABSOLUTE RULES (NON-NEGOTIABLE)\n────────────────────────────────────\n\n1. You MUST output a tool_call JSON or plain text — nothing else.\n\n2. You MUST NEVER:\n   - invent filter keys (e.g. \"date\", \"time\", \"year\")\n   - encode years, ranges, or time in the intent\n   - use scope for time\n   - use aggregate when count is sufficient\n\n3. Time expressions like:\n   - \"in 2025\"\n   - \"last year\"\n   - \"this year\"\n   - \"between 2020 and 2023\"\n\n   MUST be ignored completely.\n\n   They are handled later by the backend.\n   You MUST NOT encode them.\n\n4. If the user asks \"How many X\":\n   - action = \"count\"\n   - NEVER \"aggregate\" unless explicitly asked for sum/avg/etc.\n\n5. Status words:\n   - \"completed\", \"open\", \"incomplete\"\n   MUST go into:\n     filters.status\n\n6. Valid targets ONLY:\n   building, component, realEstate, measure, plan, project\n\n7. Physical things (windows, doors, rooms, pipes):\n   - MUST be attributes\n   - MUST NOT be targets\n\n────────────────────────────────────\nCORRECT EXAMPLE\n────────────────────────────────────\n\nUser:\n\"How many measures were completed in 2025?\"\n\nYou MUST produce:\n\n{{\n  \"type\": \"tool_call\",\n  \"name\": \"query_intent\",\n  \"arguments\": {{\n    \"intent\": {{\n      \"action\": \"count\",\n      \"target\": \"measure\",\n      \"scope\": {{ \"type\": \"current_team\" }},\n      \"filters\": {{\n        \"status\": \"completed\"\n      }}\n    }}\n  }}\n}}\n\n────────────────────────────────────\nINCORRECT (FORBIDDEN)\n────────────────────────────────────\n\n❌ filters.date\n❌ filters.year\n❌ scope.year\n❌ aggregate + metric=count\n❌ guessing backend behavior\n\nIf you violate ANY rule, the request will be rejected.\n\nAvailable tools: {}",
+                    "You are a helpful assistant with access to tools.\n\nAvailable tools: {}",
                     tools_list
                 );
                 Some(enhanced)
@@ -207,6 +219,7 @@ impl Executor {
         llm: Arc<dyn LlmModelTrait>,
         messages: Vec<ChatMessage>,
         persona: Option<&str>,
+        prompt_role: PromptRole,
         system_prompt_override: Option<&str>,
         memory_update: Option<&str>,
         options: GenerateOptions,
@@ -244,13 +257,26 @@ impl Executor {
         // Get memory context (respect user input embedding decision)
         let memory_context = self.retrieve_memory_context_with_decision(&messages, persona_name, &memory_config, &user_decision).await;
 
-        // Build enhanced system prompt with available tools listed
-        let enhanced_system_prompt = self.build_enhanced_system_prompt(system_prompt_override);
+        // Build system prompt based on role
+        let system_prompt = match prompt_role {
+            PromptRole::IntentCompiler => {
+                // Compiler prompt is immutable and tool-agnostic
+                debug_assert!(
+                    !intent_compiler_prompt().contains("Available tools"),
+                    "Compiler prompt must not contain tool information"
+                );
+                Some(intent_compiler_prompt().to_string())
+            }
+            PromptRole::Conversational => {
+                // Chat prompts can be enhanced with tool information
+                self.build_chat_system_prompt(system_prompt_override)
+            }
+        };
 
         // Build full messages with memory
         let full_messages = self.system_prompt.build_chat_messages(
             &messages,
-            enhanced_system_prompt.as_deref(),
+            system_prompt.as_deref(),
             persona,
             Some(&memory_context),
         );
@@ -597,6 +623,7 @@ impl Executor {
         llm: Arc<dyn LlmModelTrait>,
         messages: Vec<ChatMessage>,
         persona: Option<&str>,
+        prompt_role: PromptRole,
         system_prompt_override: Option<&str>,
         memory_update: Option<&str>,
         options: GenerateOptions,
@@ -633,10 +660,26 @@ impl Executor {
         // Get memory context respecting user input embedding decision
         let memory_context = self.retrieve_memory_context_with_decision(&messages, &persona_name, &memory_config, &user_decision).await;
 
+        // Build system prompt based on role
+        let system_prompt = match prompt_role {
+            PromptRole::IntentCompiler => {
+                // Compiler prompt is immutable and tool-agnostic
+                debug_assert!(
+                    !intent_compiler_prompt().contains("Available tools"),
+                    "Compiler prompt must not contain tool information"
+                );
+                Some(intent_compiler_prompt().to_string())
+            }
+            PromptRole::Conversational => {
+                // Chat prompts can be enhanced with tool information
+                self.build_chat_system_prompt(system_prompt_override)
+            }
+        };
+
         // Build full messages with memory
         let full_messages = self.system_prompt.build_chat_messages(
             &messages,
-            system_prompt_override,
+            system_prompt.as_deref(),
             Some(&persona_name),
             Some(&memory_context),
         );
