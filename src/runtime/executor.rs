@@ -315,6 +315,8 @@ impl Executor {
                 // Parse the intent from tool arguments
                 match crate::tools::graphql::IntentQueryTool::parse_intent(&tool_call.arguments.args) {
                     Ok(mut intent) => {
+                        // 🔒 EXECUTOR NORMALIZATION STEP: Physical attribute ownership rewrite
+                        crate::tools::graphql::IntentQueryTool::rewrite_physical_attribute_ownership(&mut intent);
                         // EXECUTOR GUARDRAIL: Validate intent shape BEFORE any processing
                         // Extract the intent value from the payload and validate it
                         let payload_obj = match tool_call.arguments.args.as_object() {
@@ -435,16 +437,25 @@ impl Executor {
             }
 
             // Check tool eligibility FIRST - this is the single source of truth for intent
-            let explicitly_requested = Self::is_tool_explicitly_requested(&tool_call.name, &last_user_msg);
-            let eligibility_ctx = ToolEligibilityContext {
-                user_message: &last_user_msg,
-                assistant_message: &reply,
-                explicitly_requested,
-                persona: persona_name,
-                intent: parsed_intent.as_ref(),
+            // EXCEPTION: query_intent is the compiler output channel, not a user tool
+            // It is implicitly eligible if the intent passes validation + normalization
+            // This ensures the LLM can always emit valid intents without explicit user requests
+            let is_eligible = if tool_call.name == "query_intent" {
+                // Compiler tool is always eligible (intent validation happens elsewhere)
+                true
+            } else {
+                let explicitly_requested = Self::is_tool_explicitly_requested(&tool_call.name, &last_user_msg);
+                let eligibility_ctx = ToolEligibilityContext {
+                    user_message: &last_user_msg,
+                    assistant_message: &reply,
+                    explicitly_requested,
+                    persona: persona_name,
+                    intent: parsed_intent.as_ref(),
+                };
+                tool.is_eligible(&eligibility_ctx)
             };
 
-            if !tool.is_eligible(&eligibility_ctx) {
+            if !is_eligible {
                 tracing::info!(
                     "Tool call ignored: '{}' not eligible for message '{}' - treating as plain text",
                     tool_call.name,

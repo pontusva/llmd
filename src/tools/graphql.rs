@@ -904,6 +904,10 @@ impl ToolEligibility for IntentQueryTool {
     }
 }
 
+// Special eligibility logic for query_intent tool (compiler output channel)
+// This is handled at the executor level to ensure query_intent is always eligible
+// when the intent passes validation + normalization
+
 impl IntentQueryTool {
     /// Check if message appears to be conversational/small talk
     fn is_conversational(message: &str) -> bool {
@@ -922,6 +926,55 @@ impl IntentQueryTool {
             .any(|phrase| message.contains(phrase))
     }
 
+    /// Check if an attribute is a physical object (never valid as target)
+    fn is_physical_object(attr: &str) -> bool {
+        matches!(
+            attr.to_lowercase().as_str(),
+            "window" | "windows"
+            | "door" | "doors"
+            | "room" | "rooms"
+            | "pipe" | "pipes"
+            | "sensor" | "sensors"
+        )
+    }
+
+    /// Normalize physical attributes to singular form
+    fn normalize_physical_attribute(attr: &str) -> String {
+        match attr.to_lowercase().as_str() {
+            "windows" => "window",
+            "doors" => "door",
+            "rooms" => "room",
+            "pipes" => "pipe",
+            "sensors" => "sensor",
+            other => other,
+        }
+        .to_string()
+    }
+
+    /// Rule: Physical attributes are owned by component, never by building
+    /// If intent.attribute ∈ PhysicalObjects → intent.target MUST be component
+    pub fn rewrite_physical_attribute_ownership(
+        intent: &mut Intent,
+    ) {
+        let Some(attr) = intent.attribute.clone() else {
+            return;
+        };
+
+        if Self::is_physical_object(&attr) {
+            // Normalize attribute to singular
+            intent.attribute = Some(Self::normalize_physical_attribute(&attr));
+
+            // Enforce ownership: physical things belong to components
+            if intent.target == Target::Building {
+                tracing::info!(
+                    "🔧 Rewriting intent target from Building → Component due to physical attribute '{}'",
+                    attr
+                );
+
+                intent.target = Target::Component;
+            }
+        }
+    }
 
     /// Parse Intent from tool arguments
     pub fn parse_intent(args: &Value) -> Result<Intent, ToolError> {
@@ -3686,6 +3739,101 @@ mod tests {
             IntentQueryTool::extract_building_name_from_message("building Räven that has measures"),
             Some("Räven".to_string())
         );
+    }
+
+    #[test]
+    fn test_rewrite_physical_attribute_ownership() {
+        // Test: building + windows → component + window
+        let mut intent = Intent {
+            action: Action::Count,
+            target: Target::Building,
+            attribute: Some("windows".to_string()),
+            scope: Scope {
+                r#type: ScopeType::CurrentTeam,
+                building_id: None,
+                real_estate_id: None,
+                building_name: None,
+                real_estate_name: None,
+            },
+            metric: None,
+            filters: None,
+            limit: None,
+            group_by: None,
+        };
+
+        IntentQueryTool::rewrite_physical_attribute_ownership(&mut intent);
+
+        assert_eq!(intent.target, Target::Component);
+        assert_eq!(intent.attribute, Some("window".to_string()));
+
+        // Test: building + doors → component + door
+        let mut intent2 = Intent {
+            action: Action::Count,
+            target: Target::Building,
+            attribute: Some("doors".to_string()),
+            scope: Scope {
+                r#type: ScopeType::CurrentTeam,
+                building_id: None,
+                real_estate_id: None,
+                building_name: None,
+                real_estate_name: None,
+            },
+            metric: None,
+            filters: None,
+            limit: None,
+            group_by: None,
+        };
+
+        IntentQueryTool::rewrite_physical_attribute_ownership(&mut intent2);
+
+        assert_eq!(intent2.target, Target::Component);
+        assert_eq!(intent2.attribute, Some("door".to_string()));
+
+        // Test: component + windows should stay as component + window
+        let mut intent3 = Intent {
+            action: Action::Count,
+            target: Target::Component,
+            attribute: Some("windows".to_string()),
+            scope: Scope {
+                r#type: ScopeType::CurrentTeam,
+                building_id: None,
+                real_estate_id: None,
+                building_name: None,
+                real_estate_name: None,
+            },
+            metric: None,
+            filters: None,
+            limit: None,
+            group_by: None,
+        };
+
+        IntentQueryTool::rewrite_physical_attribute_ownership(&mut intent3);
+
+        assert_eq!(intent3.target, Target::Component);
+        assert_eq!(intent3.attribute, Some("window".to_string()));
+
+        // Test: building + non-physical attribute should stay as building
+        let mut intent4 = Intent {
+            action: Action::Count,
+            target: Target::Building,
+            attribute: Some("floors".to_string()), // "floors" is not in our physical objects list
+            scope: Scope {
+                r#type: ScopeType::CurrentTeam,
+                building_id: None,
+                real_estate_id: None,
+                building_name: None,
+                real_estate_name: None,
+            },
+            metric: None,
+            filters: None,
+            limit: None,
+            group_by: None,
+        };
+
+        IntentQueryTool::rewrite_physical_attribute_ownership(&mut intent4);
+
+        assert_eq!(intent4.target, Target::Building); // Should remain Building
+        assert_eq!(intent4.attribute, Some("floors".to_string())); // Should remain unchanged
     }
 }
 
