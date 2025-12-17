@@ -1,8 +1,8 @@
-llmd — LLM Intent Compiler & Execution Runtime
+llmd — Intent Compilation & Execution Runtime (LLM-Driven)
 
 llmd is a secure, deterministic runtime for using Large Language Models (LLMs) as intent compilers, not free-form chatbots.
 
-It translates natural language into strict, validated intents, executes them through guarded tools, and optionally returns conversational responses — all while enforcing grammar, scope, and security constraints.
+It translates natural language into strict, validated intents, executes them through guarded tools, and optionally returns conversational responses (Natural-language responses are generated after execution and have no authority over execution) — all while enforcing grammar, scope, and security constraints.
 
 This architecture is designed for production systems, not demos.
 
@@ -132,6 +132,7 @@ The executor can:
 • Reject unsupported filters
 • Reject unsafe execution
 
+Only the executor can cause data access or side effects.
 The LLM cannot override this.
 
 ⸻
