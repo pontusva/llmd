@@ -56,7 +56,8 @@ impl Executor {
 
 
     /// Tool eligibility gate - determines if a specific tool call is appropriate for the conversation
-    fn is_tool_eligible(tool_name: &str, user_text: &str, assistant_text: &str) -> bool {
+    #[allow(dead_code)]
+    fn is_tool_eligible(tool_name: &str, user_text: &str, _assistant_text: &str) -> bool {
         match tool_name {
             "echo" => Self::is_echo_tool_eligible(user_text),
             // Add other tool-specific eligibility checks here as needed
@@ -292,224 +293,248 @@ impl Executor {
         opts.messages = full_messages;
         let reply = llm.generate_with_options(opts).await?;
 
+        tracing::info!("🤖 LLM raw response:\n{}", reply);
+
         // Parse model output for tool calls
         if allow_tools {
             if let Some(tool_call) = parse_tool_call(&reply) {
-            // Tool call detected - validate tool registry and eligibility
-            tracing::info!("Tool call detected: {} with arguments {:?}", tool_call.name, tool_call.arguments);
+                // Tool call detected - validate tool registry and eligibility
+                tracing::info!("🛠️ Tool call detected: {} with arguments {:?}", tool_call.name, tool_call.arguments);
 
-            // Tool execution whitelisting: only execute registered tools
-            let tool = match self.tool_registry.get(&tool_call.name) {
-                Some(t) => t,
-                None => {
-                    // Unknown tool → jail retry (hallucinated tool name)
-                    tracing::warn!("Rejected unknown tool call: {} (not in registry)", tool_call.name);
-                    let jail_reply = self.execute_jail_retry(llm, &messages, persona, &options).await?;
-                    let safe_reply = Self::strip_chatml(&jail_reply);
-                    return Ok(safe_reply);
-                }
-            };
-
-            // Parse Intent for eligibility checking (only for query_intent tool)
-            let parsed_intent = if tool_call.name == "query_intent" {
-                // Parse the intent from tool arguments
-                match crate::tools::graphql::IntentQueryTool::parse_intent(&tool_call.arguments.args) {
-                    Ok(mut intent) => {
-                        // EXECUTOR GUARDRAIL: Validate intent shape BEFORE any processing
-                        // Extract the intent value from the payload and validate it
-                        let payload_obj = match tool_call.arguments.args.as_object() {
-                            Some(obj) => obj,
-                            None => {
-                                tracing::warn!("Invalid tool arguments for '{}' - not a JSON object", tool_call.name);
-                                return Ok(serde_json::json!({
-                                    "error": "Invalid tool arguments",
-                                    "details": "Tool arguments must be a JSON object",
-                                    "tool": tool_call.name
-                                }).to_string());
-                            }
-                        };
-
-                        let intent_value = match payload_obj.get("intent") {
-                            Some(intent) => intent,
-                            None => {
-                                tracing::warn!("Missing 'intent' field in tool arguments for '{}'", tool_call.name);
-                                return Ok(serde_json::json!({
-                                    "error": "Invalid tool arguments",
-                                    "details": "Missing required 'intent' field in tool arguments",
-                                    "tool": tool_call.name
-                                }).to_string());
-                            }
-                        };
-
-                        if let Err(e) = crate::tools::graphql::IntentQueryTool::validate_intent_shape(intent_value) {
-                            tracing::warn!(
-                                "Intent shape validation failed for tool call '{}' - rejecting: {}",
-                                tool_call.name, e
-                            );
-                            return Ok(serde_json::json!({
-                                "error": "Invalid intent structure",
-                                "details": format!("{}", e),
-                                "tool": tool_call.name
-                            }).to_string());
-                        }
-
-                        // Apply time and status filter normalization from user message
-                        crate::tools::graphql::IntentQueryTool::normalize_time_and_status_filters(
-                            &mut intent,
-                            &last_user_msg
-                        );
-
-                        // Normalize and lower intent from logical to physical representation
-                        if let Err(e) = crate::tools::graphql::intent_lowering::normalize_intent(&mut intent, &*self.name_registry) {
-                            tracing::warn!(
-                                "Lowered intent validation failed for tool call '{}' - rejecting: {}",
-                                tool_call.name, e
-                            );
-                            return Ok(serde_json::json!({
-                                "error": "Invalid lowered intent",
-                                "details": format!("{}", e),
-                                "tool": tool_call.name
-                            }).to_string());
-                        }
-
-                        Some(intent)
-                    },
-                    Err(_) => {
-                        tracing::warn!(
-                            "Invalid intent payload in tool call '{}' - rejecting without jail retry",
-                            tool_call.name
-                        );
-                        // Invalid intent = hard stop, no jail retry for malformed intents
-                        let safe_reply = Self::strip_chatml(&reply);
-                        return Ok(safe_reply);
-                    }
-                }
-            } else {
-                None // Other tools don't use Intent
-            };
-
-            // Debug log filters before eligibility check
-            if let Some(ref intent) = parsed_intent {
-                if let Some(ref filters) = intent.filters {
-                    tracing::info!("🔍 Intent filters before eligibility: {:?}", filters);
-                }
-            }
-
-            // Check tool eligibility FIRST - this is the single source of truth for intent
-            // EXCEPTION: query_intent is the compiler output channel, not a user tool
-            // It is implicitly eligible if the intent passes validation + normalization
-            // This ensures the LLM can always emit valid intents without explicit user requests
-            let is_eligible = if tool_call.name == "query_intent" {
-                // Compiler tool is always eligible (intent validation happens elsewhere)
-                true
-            } else {
-                let explicitly_requested = Self::is_tool_explicitly_requested(&tool_call.name, &last_user_msg);
-                let eligibility_ctx = ToolEligibilityContext {
-                    user_message: &last_user_msg,
-                    assistant_message: &reply,
-                    explicitly_requested,
-                    persona: persona_name,
-                    intent: parsed_intent.as_ref(),
-                };
-                tool.is_eligible(&eligibility_ctx)
-            };
-
-            if !is_eligible {
-                tracing::info!(
-                    "Tool call ignored: '{}' not eligible for message '{}' - treating as plain text",
-                    tool_call.name,
-                    last_user_msg
-                );
-                // Tool call not eligible - treat model output as plain text, no jail retry
-                // Fall through to plain text processing below
-            } else {
-                // Tool is eligible - proceed directly to validation and execution
-                // NO further intent checks by executor - ToolEligibility is authoritative
-
-                // Additional validation for echo tool arguments
-                if tool_call.name == "echo" && !Self::validate_echo_tool_arguments(&tool_call.arguments.args) {
-                    tracing::warn!("Echo tool rejected: invalid arguments {:?}", tool_call.arguments.args);
-                    let jail_reply = self.execute_jail_retry(llm, &messages, persona, &options).await?;
-                    let safe_reply = Self::strip_chatml(&jail_reply);
-                    return Ok(safe_reply);
+                // INVARIANT 1 ENFORCEMENT: IntentCompiler MUST use query_intent
+                if prompt_role == PromptRole::IntentCompiler && tool_call.name != "query_intent" {
+                    tracing::error!("🚫 Invariant Violation: IntentCompiler used forbidden tool '{}' instead of 'query_intent'", tool_call.name);
+                    return Err(anyhow::anyhow!("Compiler phase violation: illegal tool usage"));
                 }
 
-                // Tool is eligible and arguments are valid, execute it
-                let tool_input = crate::runtime::toolport::ToolInput {
-                    payload: tool_call.arguments.args,
-                    metadata: crate::runtime::toolport::ToolMetadata {
-                        tool_name: tool_call.name.clone(),
-                    },
-                    user_message: last_user_msg.clone(),
-                    parsed_intent: if tool_call.name == "query_intent" {
-                        parsed_intent.clone() // Pass the normalized intent for query_intent tool
-                    } else {
-                        None // Other tools don't use pre-parsed intents
-                    },
-                };
-
-                tracing::info!("Executing eligible tool: {}", tool_call.name);
-
-                // Create executor context with injected name registry
-                let executor_ctx = ExecutorContext {
-                    name_registry: self.name_registry.clone(),
-                };
-
-                match tool.execute(tool_input, &executor_ctx) {
-                    Ok(tool_output) => {
-                        tracing::info!("Tool execution succeeded: {}", tool_call.name);
-                        // Tool results are always safe - strip ChatML and return
-                        let result = serde_json::to_string_pretty(&tool_output.payload)
-                            .unwrap_or_else(|_| "{\"error\":\"invalid tool output\"}".to_string());
-                        let safe_result = Self::strip_chatml(&result);
-
-                        // Make decision for tool result
-                        let tool_result_decision_ctx = self.create_decision_context(
-                            persona_name,
-                            memory_update,
-                            &last_user_msg,
-                            &safe_result,
-                            false,
-                        );
-                        let tool_result_decision = EmbeddingDecisionMatrix::decide(
-                            MemoryEventKind::ToolResult,
-                            &tool_result_decision_ctx,
-                            &memory_config,
-                            &self.embedding_stats,
-                        );
-
-                        if memory_config.debug {
-                            tracing::info!("🧠 Tool result decision: {} ({})", tool_result_decision.reason, tool_result_decision.tags.join(","));
-                        }
-
-                        // Update memory for tool result if decision allows
-                        if tool_result_decision.should_store_memory {
-                            self.update_memory_with_decision(
-                                persona_name,
-                                &messages,
-                                &safe_result,
-                                &memory_config,
-                                &user_decision,
-                                &tool_result_decision,
-                            ).await;
-                        }
-
-                        return Ok(safe_result);
-                    }
-                    Err(tool_error) => {
-                        tracing::warn!("Tool execution failed: {} - {:?}", tool_call.name, tool_error);
-                        // Jail retry for failed tool execution (actual execution error, not intent)
+                // Tool execution whitelisting: only execute registered tools
+                let tool = match self.tool_registry.get(&tool_call.name) {
+                    Some(t) => t,
+                    None => {
+                        // Unknown tool → jail retry (hallucinated tool name)
+                        tracing::warn!("Rejected unknown tool call: {} (not in registry)", tool_call.name);
                         let jail_reply = self.execute_jail_retry(llm, &messages, persona, &options).await?;
                         let safe_reply = Self::strip_chatml(&jail_reply);
                         return Ok(safe_reply);
                     }
+                };
+
+                // Parse Intent for eligibility checking (only for query_intent tool)
+                let parsed_intent = if tool_call.name == "query_intent" {
+                    // Parse the intent from tool arguments
+                    match crate::tools::graphql::IntentQueryTool::parse_intent(&tool_call.arguments.args) {
+                        Ok(mut intent) => {
+                            // EXECUTOR GUARDRAIL: Validate intent shape BEFORE any processing
+                            // Extract the intent value from the payload and validate it
+                            let payload_obj = match tool_call.arguments.args.as_object() {
+                                Some(obj) => obj,
+                                None => {
+                                    tracing::warn!("Invalid tool arguments for '{}' - not a JSON object", tool_call.name);
+                                    return Ok(serde_json::json!({
+                                        "error": "Invalid tool arguments",
+                                        "details": "Tool arguments must be a JSON object",
+                                        "tool": tool_call.name
+                                    }).to_string());
+                                }
+                            };
+
+                            let intent_value = match payload_obj.get("intent") {
+                                Some(intent) => intent,
+                                None => {
+                                    tracing::warn!("Missing 'intent' field in tool arguments for '{}'", tool_call.name);
+                                    return Ok(serde_json::json!({
+                                        "error": "Invalid tool arguments",
+                                        "details": "Missing required 'intent' field in tool arguments",
+                                        "tool": tool_call.name
+                                    }).to_string());
+                                }
+                            };
+
+                            if let Err(e) = crate::tools::graphql::IntentQueryTool::validate_intent_shape(intent_value) {
+                                tracing::warn!(
+                                    "Intent shape validation failed for tool call '{}' - rejecting: {}",
+                                    tool_call.name, e
+                                );
+                                return Ok(serde_json::json!({
+                                    "error": "Invalid intent structure",
+                                    "details": format!("{}", e),
+                                    "tool": tool_call.name
+                                }).to_string());
+                            }
+
+                            // Apply time and status filter normalization from user message
+                            crate::tools::graphql::IntentQueryTool::normalize_time_and_status_filters(
+                                &mut intent,
+                                &last_user_msg
+                            );
+
+                            // ─────────────────────────────────────────────
+                            // Execution Enrichment (Phase 2)
+                            // Set defaults and handle partial intents
+                            // ─────────────────────────────────────────────
+                            crate::tools::graphql::IntentQueryTool::enrich_intent(&mut intent);
+
+                            if intent.partial == Some(true) {
+                                tracing::info!("🔍 Executing partial intent with defaults: {:?}", intent);
+                            }
+
+                            // Normalize and lower intent from logical to physical representation
+                            if let Err(e) = crate::tools::graphql::intent_lowering::normalize_intent(&mut intent, &*self.name_registry) {
+                                tracing::warn!(
+                                    "Lowered intent validation failed for tool call '{}' - rejecting: {}",
+                                    tool_call.name, e
+                                );
+                                return Ok(serde_json::json!({
+                                    "error": "Invalid lowered intent",
+                                    "details": format!("{}", e),
+                                    "tool": tool_call.name
+                                }).to_string());
+                            }
+
+                            Some(intent)
+                        },
+                        Err(_) => {
+                            tracing::warn!(
+                                "Invalid intent payload in tool call '{}' - rejecting without jail retry",
+                                tool_call.name
+                            );
+                            // Invalid intent = hard stop, no jail retry for malformed intents
+                            let safe_reply = Self::strip_chatml(&reply);
+                            return Ok(safe_reply);
+                        }
+                    }
+                } else {
+                    None // Other tools don't use Intent
+                };
+
+                // Debug log filters before eligibility check
+                if let Some(ref intent) = parsed_intent {
+                    if let Some(ref filters) = intent.filters {
+                        tracing::info!("🔍 Intent filters before eligibility: {:?}", filters);
+                    }
                 }
+
+                // Check tool eligibility FIRST - this is the single source of truth for intent
+                // EXCEPTION: query_intent is the compiler output channel, not a user tool
+                // It is implicitly eligible if the intent passes validation + normalization
+                // This ensures the LLM can always emit valid intents without explicit user requests
+                let is_eligible = if tool_call.name == "query_intent" {
+                    // Compiler tool is always eligible (intent validation happens elsewhere)
+                    true
+                } else {
+                    let explicitly_requested = Self::is_tool_explicitly_requested(&tool_call.name, &last_user_msg);
+                    let eligibility_ctx = ToolEligibilityContext {
+                        user_message: &last_user_msg,
+                        assistant_message: &reply,
+                        explicitly_requested,
+                        persona: persona_name,
+                        intent: parsed_intent.as_ref(),
+                    };
+                    tool.is_eligible(&eligibility_ctx)
+                };
+
+                if !is_eligible {
+                    tracing::info!(
+                        "Tool call ignored: '{}' not eligible for message '{}' - treating as plain text",
+                        tool_call.name,
+                        last_user_msg
+                    );
+                    // Tool call not eligible - treat model output as plain text, no jail retry
+                    // Fall through to plain text processing below
+                } else {
+                    // Tool is eligible - proceed directly to validation and execution
+                    // NO further intent checks by executor - ToolEligibility is authoritative
+
+                    // Additional validation for echo tool arguments
+                    if tool_call.name == "echo" && !Self::validate_echo_tool_arguments(&tool_call.arguments.args) {
+                        tracing::warn!("Echo tool rejected: invalid arguments {:?}", tool_call.arguments.args);
+                        let jail_reply = self.execute_jail_retry(llm, &messages, persona, &options).await?;
+                        let safe_reply = Self::strip_chatml(&jail_reply);
+                        return Ok(safe_reply);
+                    }
+
+                    // Tool is eligible and arguments are valid, execute it
+                    let tool_input = crate::runtime::toolport::ToolInput {
+                        payload: tool_call.arguments.args,
+                        metadata: crate::runtime::toolport::ToolMetadata {
+                            tool_name: tool_call.name.clone(),
+                        },
+                        user_message: last_user_msg.clone(),
+                        parsed_intent: if tool_call.name == "query_intent" {
+                            parsed_intent.clone() // Pass the normalized intent for query_intent tool
+                        } else {
+                            None // Other tools don't use pre-parsed intents
+                        },
+                    };
+
+                    tracing::info!("Executing eligible tool: {}", tool_call.name);
+
+                    // Create executor context with injected name registry
+                    let executor_ctx = ExecutorContext {
+                        name_registry: self.name_registry.clone(),
+                    };
+
+                    match tool.execute(tool_input, &executor_ctx) {
+                        Ok(tool_output) => {
+                            tracing::info!("Tool execution succeeded: {}", tool_call.name);
+                            // Tool results are always safe - strip ChatML and return
+                            let result = serde_json::to_string_pretty(&tool_output.payload)
+                                .unwrap_or_else(|_| "{\"error\":\"invalid tool output\"}".to_string());
+                            let safe_result = Self::strip_chatml(&result);
+
+                            // Make decision for tool result
+                            let tool_result_decision_ctx = self.create_decision_context(
+                                persona_name,
+                                memory_update,
+                                &last_user_msg,
+                                &safe_result,
+                                false,
+                            );
+                            let tool_result_decision = EmbeddingDecisionMatrix::decide(
+                                MemoryEventKind::ToolResult,
+                                &tool_result_decision_ctx,
+                                &memory_config,
+                                &self.embedding_stats,
+                            );
+
+                            if memory_config.debug {
+                                tracing::info!("🧠 Tool result decision: {} ({})", tool_result_decision.reason, tool_result_decision.tags.join(","));
+                            }
+
+                            // Update memory for tool result if decision allows
+                            if tool_result_decision.should_store_memory {
+                                self.update_memory_with_decision(
+                                    persona_name,
+                                    &messages,
+                                    &safe_result,
+                                    &memory_config,
+                                    &user_decision,
+                                    &tool_result_decision,
+                                ).await;
+                            }
+
+                            return Ok(safe_result);
+                        }
+                        Err(tool_error) => {
+                            tracing::warn!("Tool execution failed: {} - {:?}", tool_call.name, tool_error);
+                            // Jail retry for failed tool execution (actual execution error, not intent)
+                            let jail_reply = self.execute_jail_retry(llm, &messages, persona, &options).await?;
+                            let safe_reply = Self::strip_chatml(&jail_reply);
+                            return Ok(safe_reply);
+                        }
+                    }
+                }
+            } else if prompt_role == PromptRole::IntentCompiler {
+                // INVARIANT 1 ENFORCEMENT: IntentCompiler MUST emit an intent (tool call)
+                tracing::error!("🚫 Invariant Violation: IntentCompiler failed to emit a 'query_intent' tool call.");
+                return Err(anyhow::anyhow!("Compiler phase violation: no intent produced"));
             }
         }
 
         // No tool call detected - validate response safety
         if Self::looks_like_json(&reply) {
             // JSON-like output that's not a valid tool call is unsafe - jail retry
+            tracing::warn!("⚠️ Detected JSON-like output that is NOT a valid tool call. Possible hallucination or malformed structure.");
             tracing::warn!("Rejected unsafe JSON output (not a valid tool call)");
             let jail_reply = self.execute_jail_retry(llm, &messages, persona, &options).await?;
             let safe_reply = Self::strip_chatml(&jail_reply);
@@ -550,6 +575,28 @@ impl Executor {
 
         // Plain text response - make decision for assistant response
         let safe_reply = Self::strip_chatml(&reply);
+
+        // ENFORCEMENT: If in IntentCompiler role, plain text is ONLY allowed for clarification.
+        // If the reply looks like it's answering a data question (e.g. "There are 5..."), 
+        // and we expected an intent, this is a violation of the 2-phase model.
+        if prompt_role == PromptRole::IntentCompiler && allow_tools {
+            let reply_lower = safe_reply.to_lowercase();
+            // Heuristic for "answering directly" vs "clarifying"
+            let is_answering_directly = reply_lower.contains("there are") || 
+                                        reply_lower.contains("i found") || 
+                                        reply_lower.contains("the total") ||
+                                        (safe_reply.chars().any(|c| c.is_ascii_digit()) && !safe_reply.contains('?'));
+            
+            if is_answering_directly {
+                tracing::warn!("IntentCompiler attempted to answer directly: {}", safe_reply);
+                return Ok(serde_json::json!({
+                    "error": "Direct answer forbidden",
+                    "details": "The system attempted to answer a data question directly instead of using the execution engine.",
+                    "action": "please_rephrase"
+                }).to_string());
+            }
+        }
+
         let assistant_decision_ctx = self.create_decision_context(
             persona_name,
             memory_update,
@@ -586,16 +633,6 @@ impl Executor {
             tracing::warn!("Rejected unsafe plain text response");
             Ok("I apologize, but I encountered an error processing your request.".to_string())
         }
-        } else {
-            // Tools disabled - return response as-is if safe
-            let safe_reply = Self::strip_chatml(&reply);
-            if self.validate_response(&safe_reply, false) {
-                Ok(safe_reply)
-            } else {
-                tracing::warn!("Rejected unsafe plain text response (tools disabled)");
-                Ok("I apologize, but I encountered an error processing your request.".to_string())
-            }
-        }
     }
 
     /// Execute a streaming chat completion request.
@@ -609,7 +646,7 @@ impl Executor {
         system_prompt_override: Option<&str>,
         memory_update: Option<&str>,
         options: GenerateOptions,
-        allow_tools: bool,
+        _allow_tools: bool,
     ) -> anyhow::Result<(Box<dyn Stream<Item = String> + Send + Unpin>, MemoryUpdateTask)> {
         let persona_name = persona.unwrap_or("default").to_string();
 
@@ -672,6 +709,13 @@ impl Executor {
         opts.messages = full_messages;
         let token_stream = llm.stream_generate(opts).await?;
 
+        // INVARIANT 1 ENFORCEMENT: IntentCompiler MUST NOT stream plain text for data queries.
+        // For streaming, we can't easily check the *content* until it's finished, but we can 
+        // signal that this stream is expected to be a tool call.
+        if prompt_role == PromptRole::IntentCompiler {
+            tracing::info!("📡 Streaming IntentCompiler output - expecting tool call JSON");
+        }
+
         // Create memory update task for when streaming completes
         let memory_task = if !matches!(memory_update, Some("disable")) && user_decision.should_store_memory {
             let messages_clone = messages.clone();
@@ -681,6 +725,7 @@ impl Executor {
                 messages: messages_clone,
                 memory_config: memory_config_clone,
                 user_decision: user_decision.clone(),
+                prompt_role,
             }
         } else {
             MemoryUpdateTask::Disabled
@@ -692,8 +737,19 @@ impl Executor {
     /// Complete a streaming execution by updating memory.
     /// This is called after the stream finishes to perform memory mutations.
     pub async fn complete_stream(&self, memory_task: MemoryUpdateTask, collected_response: &str) {
+        tracing::info!("🤖 Stream collected response:\n{}", collected_response);
         match memory_task {
-            MemoryUpdateTask::Enabled { persona_name, messages, memory_config, user_decision } => {
+            MemoryUpdateTask::Enabled { persona_name, messages, memory_config, user_decision, prompt_role } => {
+                // INVARIANT 1 ENFORCEMENT: IntentCompiler MUST emit a tool call
+                if prompt_role == PromptRole::IntentCompiler {
+                    if parse_tool_call(collected_response).is_none() {
+                        tracing::error!("🚫 Invariant Violation: IntentCompiler stream finished without a 'query_intent' tool call.");
+                        // We can't easily error back to the user here since the stream is finished, 
+                        // but we can log it and avoid storing it in memory as a "success".
+                        return;
+                    }
+                }
+
                 // Extract last user message for decision making
                 let last_user_msg = messages.last()
                     .map(|m| m.content.clone())
@@ -753,6 +809,7 @@ impl Executor {
         }
     }
 
+    #[allow(dead_code)]
     async fn retrieve_memory_context(
         &self,
         messages: &[ChatMessage],
@@ -859,6 +916,7 @@ impl Executor {
         }
     }
 
+    #[allow(dead_code)]
     async fn update_memory(
         &self,
         persona_name: &str,
@@ -989,6 +1047,7 @@ pub enum MemoryUpdateTask {
         messages: Vec<ChatMessage>,
         memory_config: MemoryConfig,
         user_decision: DecisionResult,
+        prompt_role: PromptRole,
     },
     Disabled,
 }

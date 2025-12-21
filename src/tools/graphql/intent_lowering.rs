@@ -239,22 +239,10 @@ fn lower_physical_attribute(intent: &mut Intent, introspection: &IntentIntrospec
 
 /// Validate that a lowered intent satisfies all invariants
 pub fn validate_lowered_intent(intent: &Intent) -> Result<(), LoweringError> {
-    let introspection = INTROSPECTION.get().ok_or(LoweringError::NotInitialized)?;
+    let _introspection = INTROSPECTION.get().ok_or(LoweringError::NotInitialized)?;
 
-    // Component targets must have component_type filter
-    if intent.target == Target::Component {
-        if let Some(filters) = &intent.filters {
-            if filters.component_type.is_none() {
-                return Err(LoweringError::InvalidLoweredTarget(
-                    "Component target must have component_type filter".to_string()
-                ));
-            }
-        } else {
-            return Err(LoweringError::InvalidLoweredTarget(
-                "Component target must have filters".to_string()
-            ));
-        }
-    }
+    // Relaxed validation: Phase 1 (Classification) only requires action + target + scope.
+    // We only reject if the intent is structurally impossible to execute.
 
     // No intent may have both attribute and component_type
     if let (Some(_), Some(filters)) = (&intent.attribute, &intent.filters) {
@@ -262,17 +250,6 @@ pub fn validate_lowered_intent(intent: &Intent) -> Result<(), LoweringError> {
             return Err(LoweringError::InvalidLoweredTarget(
                 "Cannot have both attribute and component_type".to_string()
             ));
-        }
-    }
-
-    // Building targets may not have physical attributes
-    if intent.target == Target::Building {
-        if let Some(attribute) = &intent.attribute {
-            if is_physical_attribute(attribute) {
-                return Err(LoweringError::InvalidLoweredTarget(
-                    format!("Building target cannot have physical attribute '{}'", attribute)
-                ));
-            }
         }
     }
 
@@ -321,6 +298,7 @@ mod tests {
             filters: None,
             limit: None,
             group_by: None,
+            partial: None,
         }
     }
 
@@ -358,12 +336,13 @@ mod tests {
     fn non_physical_attribute_unchanged() {
         initialize_lowering();
 
-        let mut intent = setup_test_intent(Target::Building, Some("floors"));
+        let intent = setup_test_intent(Target::Building, Some("floors"));
         let original = intent.clone();
-        lower_intent(&mut intent).unwrap();
+        let mut intent_mut = intent.clone();
+        lower_intent(&mut intent_mut).unwrap();
 
-        assert_eq!(intent.target, original.target);
-        assert_eq!(intent.attribute, original.attribute);
+        assert_eq!(intent_mut.target, original.target);
+        assert_eq!(intent_mut.attribute, original.attribute);
     }
 
     #[test]
@@ -411,6 +390,7 @@ mod tests {
             }),
             limit: None,
             group_by: None,
+            partial: None,
         };
 
         let result = validate_lowered_intent(&intent);
@@ -439,6 +419,7 @@ mod tests {
             filters: None,
             limit: None,
             group_by: None,
+            partial: None,
         };
 
         let registry = MockNameRegistry;
@@ -497,6 +478,7 @@ mod tests {
             filters: None,
             limit: None,
             group_by: None,
+            partial: None,
         };
 
         let registry = MockNameRegistry;

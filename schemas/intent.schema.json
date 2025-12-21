@@ -138,6 +138,12 @@
         },
         "target": {
           "$ref": "#/definitions/Target"
+        },
+        "partial": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       }
     },

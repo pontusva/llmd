@@ -41,6 +41,9 @@ pub struct Intent {
     /// Optional grouping
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_by: Option<GroupBy>,
+    /// Signal that this intent is partial and requires enrichment or clarification
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial: Option<bool>,
 }
 
 /// Intent envelope for JSON Schema generation
@@ -546,49 +549,17 @@ impl CapabilityMatrix for CapabilityRegistry {
                 continue;
             }
 
-            // Check attribute pattern
-            match &capability.attribute {
-                AttributePattern::Any => {
-                    // Any attribute allowed - continue checking
-                }
-                AttributePattern::None => {
-                    if intent.attribute.is_some() {
-                        continue; // Attribute provided but not allowed
-                    }
-                }
-                AttributePattern::Exact(expected) => {
-                    if intent.attribute.as_ref() != Some(expected) {
-                        continue; // Attribute doesn't match exactly
-                    }
-                }
-            }
-
-            // Check metric pattern
-            match &capability.metric {
-                MetricPattern::Any => {
-                    // Any metric allowed - continue checking
-                }
-                MetricPattern::None => {
-                    if intent.metric.is_some() {
-                        continue; // Metric provided but not allowed
-                    }
-                }
-                MetricPattern::Exact(expected) => {
-                    if intent.metric.as_ref() != Some(expected) {
-                        continue; // Metric doesn't match exactly
-                    }
-                }
-            }
-
-            // All patterns matched - this capability supports the intent
+            // Phase 1 (Classification) only requires action + target + scope.
+            // Attributes and Metrics are hints - we don't reject based on them here.
+            // The executor will handle enrichment and validation in Phase 2.
             return CapabilityDecision::Supported;
         }
 
         // No matching capability found
         CapabilityDecision::Unsupported {
             reason: format!(
-                "Unsupported combination: action={:?}, target={:?}, attribute={:?}, metric={:?}",
-                intent.action, intent.target, intent.attribute, intent.metric
+                "Unsupported action/target combination: action={:?}, target={:?}",
+                intent.action, intent.target
             ),
         }
     }
@@ -640,13 +611,30 @@ pub fn build_where_clause(intent: &Intent) -> crate::tools::graphql::ast::GqlVal
 
     let mut conditions = Vec::new();
 
-    // ---- scope → where
-    if let Some(building_id) = &intent.scope.building_id {
-        conditions.push(("buildingId".into(), GqlValue::String(building_id.clone())));
-    }
-
-    if let Some(real_estate_id) = &intent.scope.real_estate_id {
-        conditions.push(("realEstateId".into(), GqlValue::String(real_estate_id.clone())));
+    // INVARIANT 2 ENFORCEMENT: GraphQL query builders must never receive names.
+    // They must operate only on resolved IDs.
+    match intent.scope.r#type {
+        ScopeType::Building => {
+            if let Some(id) = &intent.scope.building_id {
+                conditions.push(("buildingId".into(), GqlValue::String(id.clone())));
+            } else {
+                // This should have been caught during normalization/lowering
+                tracing::error!("🚫 Invariant Violation: GraphQL compilation received 'building' scope without resolved building_id");
+                panic!("GraphQL invariant violation: unresolved building_id");
+            }
+        }
+        ScopeType::RealEstate => {
+            if let Some(id) = &intent.scope.real_estate_id {
+                conditions.push(("realEstateId".into(), GqlValue::String(id.clone())));
+            } else {
+                // This should have been caught during normalization/lowering
+                tracing::error!("🚫 Invariant Violation: GraphQL compilation received 'real_estate' scope without resolved real_estate_id");
+                panic!("GraphQL invariant violation: unresolved real_estate_id");
+            }
+        }
+        ScopeType::CurrentTeam => {
+            // No ID needed for team scope, it's implicit in context
+        }
     }
 
     // ---- filters → where
@@ -950,12 +938,12 @@ pub struct RequestContext {
 /// Intent-based query tool for structured data retrieval
 /// Accepts Intent JSON, compiles to GraphQL server-side
 pub struct IntentQueryTool {
-    registry: Box<dyn NameResolutionRegistry>,
+    _registry: Box<dyn NameResolutionRegistry>,
 }
 
 impl IntentQueryTool {
     pub fn new(registry: Box<dyn NameResolutionRegistry>) -> Self {
-        Self { registry }
+        Self { _registry: registry }
     }
 }
 
@@ -982,6 +970,31 @@ impl ToolEligibility for IntentQueryTool {
 // when the intent passes validation + normalization
 
 impl IntentQueryTool {
+    /// Enrich intent with defaults based on action and target
+    /// This is Phase 2 (Execution) enrichment
+    pub fn enrich_intent(intent: &mut Intent) {
+        // If metric is missing for Count/Aggregate, it's a candidate for enrichment
+        if intent.metric.is_none() {
+            match intent.action {
+                Action::Count => {
+                    intent.metric = Some(Metric::Count);
+                }
+                Action::Aggregate => {
+                    // Default to Count for generic "how many" Aggregate requests
+                    intent.metric = Some(Metric::Count);
+                    intent.partial = Some(true);
+                }
+                _ => {}
+            }
+        }
+
+        // If target is building but metric is count, ensure attribute is handled correctly
+        // (This happens in compile step, but we signal partiality if no attribute/filter provided)
+        if intent.action == Action::Count && intent.target == Target::Building && intent.attribute.is_none() && intent.filters.is_none() {
+            // "How many buildings?" is a valid but sparse intent
+        }
+    }
+
     /// Parse Intent from tool arguments
     pub fn parse_intent(args: &Value) -> Result<Intent, ToolError> {
         let obj = args.as_object()
@@ -1364,7 +1377,7 @@ impl IntentQueryTool {
 
         // Build GraphQL query based on action and target using AST
         let root_field = match (&intent.action, &intent.target, intent.attribute.as_deref()) {
-            (Action::Count, Target::Component, None) => {
+            (Action::Count, Target::Component, _) | (Action::Aggregate, Target::Component, _) if intent.metric == Some(Metric::Count) => {
                 GqlField::new("components")
                     .arg("where", where_clause)
                     .select(
@@ -1373,7 +1386,7 @@ impl IntentQueryTool {
                     )
             },
 
-            (Action::Count, Target::Building, None) => {
+            (Action::Count, Target::Building, _) | (Action::Aggregate, Target::Building, _) if intent.metric == Some(Metric::Count) => {
                 GqlField::new("buildings")
                     .arg("where", where_clause)
                     .select(
@@ -1382,7 +1395,7 @@ impl IntentQueryTool {
                     )
             },
 
-            (Action::Count, Target::Measure, None) => {
+            (Action::Count, Target::Measure, _) | (Action::Aggregate, Target::Measure, _) if intent.metric == Some(Metric::Count) => {
                 GqlField::new("measures")
                     .arg("where", where_clause)
                     .select(
@@ -1391,14 +1404,14 @@ impl IntentQueryTool {
                     )
             },
 
-            (Action::List, Target::Building, None) => {
+            (Action::List, Target::Building, _) => {
                 GqlField::new("buildings")
                     .arg("where", where_clause)
                     .select(GqlField::new("id"))
                     .select(GqlField::new("name"))
             },
 
-            (Action::Get, Target::Building, None) => {
+            (Action::Get, Target::Building, _) => {
                 GqlField::new("buildings")
                     .arg("where", where_clause)
                     .select(GqlField::new("id"))
@@ -1407,38 +1420,36 @@ impl IntentQueryTool {
                     .select(GqlField::new("yearBuilt"))
             },
 
-            (Action::Aggregate, Target::Component, None) => {
-                if let Some(Metric::Count) = intent.metric {
-                    GqlField::new("components")
-                        .arg("where", where_clause)
-                        .select(
-                            GqlField::new("_count")
-                                .select(GqlField::new("id"))
-                        )
-                } else {
-                    return Err(ToolError::InvalidParameters("Unsupported aggregation".to_string()));
-                }
+            (Action::Aggregate, Target::Building, _) if intent.metric == Some(Metric::TotalFloorArea) => {
+                GqlField::new("buildings")
+                    .arg("where", where_clause)
+                    .select(
+                        GqlField::new("_sum")
+                            .select(GqlField::new("totalFloorArea"))
+                    )
             },
 
-            (Action::Aggregate, Target::Building, None) => {
-                if let Some(Metric::TotalFloorArea) = intent.metric {
-                    GqlField::new("buildings")
-                        .arg("where", where_clause)
-                        .select(
-                            GqlField::new("_sum")
-                                .select(GqlField::new("totalFloorArea"))
-                        )
-                } else {
-                    return Err(ToolError::InvalidParameters("Unsupported building aggregation".to_string()));
-                }
+            (Action::Exists, target, _) => {
+                let field_name = match target {
+                    Target::Building => "buildings",
+                    Target::Component => "components",
+                    Target::Measure => "measures",
+                    Target::RealEstate => "realEstates",
+                    Target::Plan => "plans",
+                    Target::Project => "projects",
+                };
+                GqlField::new(field_name)
+                    .arg("where", where_clause)
+                    .arg("take", GqlValue::Number(1))
+                    .select(GqlField::new("id"))
             },
 
             _ => return Err(ToolError::InvalidParameters(
                 format!(
-                    "Invalid GraphQL shape: attributes must be lowered to targets before compilation (action={:?}, target={:?}, attribute={:?})",
+                    "Unsupported execution shape: action={:?}, target={:?}, metric={:?}. Attributes must be lowered to filters before compilation.",
                     intent.action,
                     intent.target,
-                    intent.attribute
+                    intent.metric
                 )
             )),
         };
@@ -1465,7 +1476,7 @@ impl ToolPort for IntentQueryTool {
         true
     }
 
-    fn execute(&self, input: ToolInput, ctx: &crate::runtime::executor::ExecutorContext) -> Result<ToolOutput, ToolError> {
+    fn execute(&self, input: ToolInput, _ctx: &crate::runtime::executor::ExecutorContext) -> Result<ToolOutput, ToolError> {
         // ─────────────────────────────────────────────
         // 0. JSON SCHEMA VALIDATION (HARD CONTRACT)
         // ─────────────────────────────────────────────
@@ -1494,6 +1505,12 @@ impl ToolPort for IntentQueryTool {
             Self::parse_intent(&input.payload)?
         };
 
+        // ─────────────────────────────────────────────
+        // 1.5 Execution Enrichment (Phase 2)
+        // Set defaults and handle partial intents
+        // ─────────────────────────────────────────────
+        Self::enrich_intent(&mut intent);
+
 
         // ─────────────────────────────────────────────
         // Intent lowering (logical → physical)
@@ -1502,6 +1519,27 @@ impl ToolPort for IntentQueryTool {
         intent.lower().map_err(|e| ToolError::InvalidParameters(
             format!("Intent lowering failed: {}", e)
         ))?;
+
+        // INVARIANT 2 ENFORCEMENT: Ensure scope resolution succeeded before compilation
+        match intent.scope.r#type {
+            ScopeType::Building => {
+                if intent.scope.building_id.is_none() {
+                    return Err(ToolError::InvalidParameters(
+                        format!("Scope resolution failed: Building '{}' could not be resolved to an ID", 
+                            intent.scope.building_name.as_deref().unwrap_or("unknown"))
+                    ));
+                }
+            }
+            ScopeType::RealEstate => {
+                if intent.scope.real_estate_id.is_none() {
+                    return Err(ToolError::InvalidParameters(
+                        format!("Scope resolution failed: Real Estate '{}' could not be resolved to an ID", 
+                            intent.scope.real_estate_name.as_deref().unwrap_or("unknown"))
+                    ));
+                }
+            }
+            ScopeType::CurrentTeam => {}
+        }
 
         // SCOPE NORMALIZATION GUARANTEE: If building mentioned but scope still current_team, reject
         if input.user_message.to_lowercase().contains("building")
@@ -1545,6 +1583,8 @@ impl ToolPort for IntentQueryTool {
         // ─────────────────────────────────────────────
         let graphql_query =
             Self::compile_intent_to_graphql(&intent)?;
+
+        tracing::info!("🕸️ Compiled GraphQL query:\n{}", graphql_query);
 
         // ─────────────────────────────────────────────
         // 6. Execute (placeholder)
